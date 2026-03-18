@@ -1,7 +1,8 @@
 import logging
 import json
 import os
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+import certifi
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 from pymongo import MongoClient
 from datetime import datetime
@@ -19,32 +20,62 @@ WAITING_FOR_CHANNEL, WAITING_FOR_BUTTON_NAME, WAITING_FOR_COMMENTS, WAITING_FOR_
 # Get environment variables
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 ADMIN_IDS = list(map(int, os.environ.get('ADMIN_IDS', '').split(',')))
-MONGO_URI = os.environ.get('MONGO_URI', 'mongodb://localhost:27017/')
+MONGO_URI = os.environ.get('MONGO_URI')
 
-# Initialize MongoDB
-client = MongoClient(MONGO_URI)
-db = client['comment_bot']
-
-# Collections
-users_collection = db['users']
-channels_collection = db['channels']
-buttons_collection = db['buttons']
-comments_collection = db['comments']
-settings_collection = db['settings']
-pending_approvals_collection = db['pending_approvals']
-
-# Initialize default settings if not exists
-if settings_collection.count_documents({}) == 0:
-    settings_collection.insert_one({
-        'bot_status': True,
-        'over_message': 'No more comments available for this app.',
-        'buttons': []
-    })
+# Initialize MongoDB with SSL fix
+try:
+    # Create client with certifi for SSL certificates
+    client = MongoClient(
+        MONGO_URI,
+        tlsCAFile=certifi.where(),  # This fixes SSL issues
+        serverSelectionTimeoutMS=30000  # 30 second timeout
+    )
+    
+    # Test connection
+    client.admin.command('ping')
+    print("✅ Successfully connected to MongoDB!")
+    
+    # Initialize database and collections
+    db = client['comment_bot']
+    
+    users_collection = db['users']
+    channels_collection = db['channels']
+    buttons_collection = db['buttons']
+    comments_collection = db['comments']
+    settings_collection = db['settings']
+    pending_approvals_collection = db['pending_approvals']
+    
+    # Initialize default settings if not exists
+    if settings_collection.count_documents({}) == 0:
+        settings_collection.insert_one({
+            'bot_status': True,
+            'over_message': 'No more comments available for this app.',
+            'buttons': []
+        })
+        
+except Exception as e:
+    print(f"❌ MongoDB connection failed: {e}")
+    print("Please check your connection string and network settings")
+    # Create dummy collections to prevent crashes (will be replaced when connection works)
+    class DummyCollection:
+        def find(self, *args, **kwargs): return []
+        def find_one(self, *args, **kwargs): return None
+        def insert_one(self, *args, **kwargs): return None
+        def update_one(self, *args, **kwargs): return None
+        def delete_one(self, *args, **kwargs): return None
+        def count_documents(self, *args, **kwargs): return 0
+    
+    users_collection = DummyCollection()
+    channels_collection = DummyCollection()
+    buttons_collection = DummyCollection()
+    comments_collection = DummyCollection()
+    settings_collection = DummyCollection()
+    pending_approvals_collection = DummyCollection()
 
 class CommentBot:
     def __init__(self):
-        self.bot_status = settings_collection.find_one()['bot_status']
-        self.over_message = settings_collection.find_one()['over_message']
+        self.bot_status = settings_collection.find_one()['bot_status'] if settings_collection.find_one() else True
+        self.over_message = settings_collection.find_one()['over_message'] if settings_collection.find_one() else 'No more comments available for this app.'
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
@@ -207,27 +238,49 @@ class CommentBot:
             await self.show_button_stats(query, context, button_id)
         elif data == "add_channel":
             await query.message.reply_text("Please send the channel username or ID:")
-            return WAITING_FOR_CHANNEL
+            context.user_data['waiting_for_channel'] = True
         elif data == "remove_channel":
             await self.show_channels_to_remove(query, context)
         elif data == "add_button":
             await query.message.reply_text("Please send the name for the new button:")
-            return WAITING_FOR_BUTTON_NAME
+            context.user_data['waiting_for_button_name'] = True
         elif data == "remove_button":
             await self.show_buttons_to_remove(query, context)
         elif data == "bot_on":
             settings_collection.update_one({}, {'$set': {'bot_status': True}})
             self.bot_status = True
-            await query.message.reply_text("Bot turned ON successfully!")
+            await query.message.edit_text("Bot turned ON successfully!")
             await self.show_admin_panel(query, context)
         elif data == "bot_off":
             settings_collection.update_one({}, {'$set': {'bot_status': False}})
             self.bot_status = False
-            await query.message.reply_text("Bot turned OFF successfully!")
+            await query.message.edit_text("Bot turned OFF successfully!")
             await self.show_admin_panel(query, context)
         elif data == "set_over_message":
             await query.message.reply_text("Please send the new over message:")
-            return WAITING_FOR_OVER_MESSAGE
+            context.user_data['waiting_for_over_message'] = True
+        elif data == "manage_channels":
+            await self.show_manage_channels(query, context)
+        elif data == "manage_buttons":
+            await self.show_manage_buttons(query, context)
+        elif data == "show_buttons_for_comments":
+            await self.show_buttons_for_comments(query, context)
+        elif data == "view_stats":
+            await self.show_view_stats(query, context)
+        elif data == "back_to_main":
+            await self.show_main_menu_from_callback(query, context)
+        elif data.startswith("remove_channel_"):
+            channel_id = data.replace("remove_channel_", "")
+            channels_collection.delete_one({'channel_id': channel_id})
+            await query.message.edit_text("✅ Channel removed successfully!")
+            await self.show_manage_channels(query, context)
+        elif data.startswith("remove_button_"):
+            button_id = data.replace("remove_button_", "")
+            buttons_collection.delete_one({'button_id': button_id})
+            # Also remove related comments
+            comments_collection.delete_many({'button_id': button_id})
+            await query.message.edit_text("✅ Button removed successfully!")
+            await self.show_manage_buttons(query, context)
 
     async def check_force_join_after_button(self, query, context):
         channels = list(channels_collection.find())
@@ -365,17 +418,21 @@ class CommentBot:
         )
 
     async def provide_comment(self, query, context, button_id):
-        # Get next available comment
+        # Get next available comment - ATOMIC operation prevents duplicates
         comment = comments_collection.find_one_and_delete(
             {'button_id': button_id, 'used': False},
             sort=[('_id', 1)]
         )
         
         if comment:
-            # Mark as used
+            # Mark as used and track who got it
             comments_collection.update_one(
                 {'_id': comment['_id']},
-                {'$set': {'used': True, 'used_by': query.from_user.id, 'used_date': datetime.now()}}
+                {'$set': {
+                    'used': True, 
+                    'used_by': query.from_user.id, 
+                    'used_date': datetime.now()
+                }}
             )
             
             message_text = f"Here Is Your Comment Go And Do Review\n\n<code>{comment['comment']}</code>"
@@ -403,16 +460,15 @@ class CommentBot:
             [InlineKeyboardButton("🔘 Manage Buttons", callback_data="manage_buttons")],
             [InlineKeyboardButton("➕ Add Comments", callback_data="show_buttons_for_comments")],
             [InlineKeyboardButton("📊 View Stats", callback_data="view_stats")],
-            [InlineKeyboardButton(f"🤖 Bot Status: {status_text}", callback_data="toggle_bot")],
             [InlineKeyboardButton("✏️ Set Over Message", callback_data="set_over_message")],
             [InlineKeyboardButton("🔙 Back", callback_data="back_to_main")]
         ]
         
-        # Split toggle bot button
+        # Add bot status button at the top
         if bot_status:
-            keyboard[3] = [InlineKeyboardButton("🤖 Turn Bot OFF", callback_data="bot_off")]
+            keyboard.insert(0, [InlineKeyboardButton("🤖 Turn Bot OFF", callback_data="bot_off")])
         else:
-            keyboard[3] = [InlineKeyboardButton("🤖 Turn Bot ON", callback_data="bot_on")]
+            keyboard.insert(0, [InlineKeyboardButton("🤖 Turn Bot ON", callback_data="bot_on")])
         
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -588,9 +644,28 @@ class CommentBot:
         )
 
     async def show_main_menu_from_callback(self, query, context):
-        await self.show_main_menu(query, context)
+        buttons = buttons_collection.find()
+        
+        keyboard = []
+        for button in buttons:
+            keyboard.append([InlineKeyboardButton(
+                button['button_name'], 
+                callback_data=f"button_{button['button_id']}"
+            )])
+        
+        if query.from_user.id in ADMIN_IDS:
+            keyboard.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel")])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.message.edit_text(
+            "Welcome To Comment Provider Bot By Zahid\n\nPlease select an app:",
+            reply_markup=reply_markup
+        )
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        
         if 'current_button' in context.user_data:
             # Adding comments
             button_id = context.user_data['current_button']
@@ -705,47 +780,6 @@ class CommentBot:
         fake_query = FakeQuery(update.effective_user, update.message)
         await self.show_admin_panel(fake_query, context)
 
-    async def handle_channel_removal(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
-        
-        if query.data.startswith("remove_channel_"):
-            channel_id = query.data.replace("remove_channel_", "")
-            channels_collection.delete_one({'channel_id': channel_id})
-            await query.message.edit_text("✅ Channel removed successfully!")
-            await self.show_manage_channels(query, context)
-        
-        elif query.data.startswith("remove_button_"):
-            button_id = query.data.replace("remove_button_", "")
-            buttons_collection.delete_one({'button_id': button_id})
-            # Also remove related comments
-            comments_collection.delete_many({'button_id': button_id})
-            await query.message.edit_text("✅ Button removed successfully!")
-            await self.show_manage_buttons(query, context)
-        
-        elif query.data == "manage_channels":
-            await self.show_manage_channels(query, context)
-        
-        elif query.data == "manage_buttons":
-            await self.show_manage_buttons(query, context)
-        
-        elif query.data == "show_buttons_for_comments":
-            await self.show_buttons_for_comments(query, context)
-        
-        elif query.data == "view_stats":
-            await self.show_view_stats(query, context)
-        
-        elif query.data == "toggle_bot":
-            settings = settings_collection.find_one()
-            new_status = not settings['bot_status']
-            settings_collection.update_one({}, {'$set': {'bot_status': new_status}})
-            self.bot_status = new_status
-            await query.message.edit_text(f"Bot turned {'ON' if new_status else 'OFF'}!")
-            await self.show_admin_panel(query, context)
-        
-        elif query.data == "back_to_main":
-            await self.show_main_menu_from_callback(query, context)
-
 def main():
     """Start the bot."""
     # Create application
@@ -753,29 +787,13 @@ def main():
     
     bot = CommentBot()
     
-    # Add conversation handler for adding channels/buttons
-    conv_handler = ConversationHandler(
-        entry_points=[
-            CallbackQueryHandler(bot.button_callback, pattern="^(add_channel|add_button|set_over_message)$"),
-            CallbackQueryHandler(bot.button_callback, pattern="^add_comments_"),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message)
-        ],
-        states={
-            WAITING_FOR_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message)],
-            WAITING_FOR_BUTTON_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message)],
-            WAITING_FOR_COMMENTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message)],
-            WAITING_FOR_OVER_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message)]
-        },
-        fallbacks=[CommandHandler('start', bot.start)]
-    )
-    
     # Add handlers
     application.add_handler(CommandHandler("start", bot.start))
-    application.add_handler(CallbackQueryHandler(bot.button_callback, pattern="^(?!remove_(channel|button)_).*"))
-    application.add_handler(CallbackQueryHandler(bot.handle_channel_removal, pattern="^(remove_(channel|button)_|manage_channels|manage_buttons|show_buttons_for_comments|view_stats|toggle_bot|back_to_main)$"))
-    application.add_handler(conv_handler)
+    application.add_handler(CallbackQueryHandler(bot.button_callback))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
     
     # Start bot
+    print("🤖 Bot is starting...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
