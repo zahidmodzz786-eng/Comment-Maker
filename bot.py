@@ -52,6 +52,7 @@ try:
             'over_message': 'No more comments available for this app.',
             'buttons': []
         })
+        print("✅ Default settings created!")
         
 except Exception as e:
     print(f"❌ MongoDB connection failed: {e}")
@@ -74,13 +75,37 @@ except Exception as e:
 
 class CommentBot:
     def __init__(self):
-        settings = settings_collection.find_one()
-        self.bot_status = settings['bot_status'] if settings else True
-        self.over_message = settings['over_message'] if settings else 'No more comments available for this app.'
+        # Safely get settings with error handling
+        self.load_settings()
+    
+    def load_settings(self):
+        """Load settings safely with error handling"""
+        try:
+            settings = settings_collection.find_one()
+            if settings:
+                self.bot_status = settings.get('bot_status', True)
+                self.over_message = settings.get('over_message', 'No more comments available for this app.')
+            else:
+                # Create default settings if not exists
+                settings_collection.insert_one({
+                    'bot_status': True,
+                    'over_message': 'No more comments available for this app.',
+                    'buttons': []
+                })
+                self.bot_status = True
+                self.over_message = 'No more comments available for this app.'
+                print("✅ Created default settings in __init__")
+        except Exception as e:
+            print(f"⚠️ Error loading settings: {e}")
+            self.bot_status = True
+            self.over_message = 'No more comments available for this app.'
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
         user_id = user.id
+        
+        # Reload settings to ensure latest status
+        self.load_settings()
         
         # Check if bot is on
         if not self.bot_status:
@@ -122,33 +147,51 @@ class CommentBot:
 
     async def show_admin_panel_direct(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show admin panel directly without requiring main menu"""
-        settings = settings_collection.find_one()
-        bot_status = settings['bot_status']
-        status_text = "ON ✅" if bot_status else "OFF ❌"
-        
-        keyboard = [
-            [InlineKeyboardButton("📢 Manage Channels", callback_data="manage_channels")],
-            [InlineKeyboardButton("🔘 Manage Buttons", callback_data="manage_buttons")],
-            [InlineKeyboardButton("➕ Add Comments", callback_data="show_buttons_for_comments")],
-            [InlineKeyboardButton("📊 View Stats", callback_data="view_stats")],
-            [InlineKeyboardButton("✏️ Set Over Message", callback_data="set_over_message")],
-            [InlineKeyboardButton("🔙 Main Menu", callback_data="back_to_main")]
-        ]
-        
-        # Add bot status button at the top
-        if bot_status:
-            keyboard.insert(0, [InlineKeyboardButton("🤖 Turn Bot OFF", callback_data="bot_off")])
-        else:
-            keyboard.insert(0, [InlineKeyboardButton("🤖 Turn Bot ON", callback_data="bot_on")])
-        
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(
-            "⚙️ Admin Panel\n\n"
-            f"Bot Status: {status_text}\n"
-            "Select an option:",
-            reply_markup=reply_markup
-        )
+        try:
+            # Reload settings to ensure latest
+            self.load_settings()
+            
+            settings = settings_collection.find_one()
+            if not settings:
+                # Create settings if still not exists
+                settings_collection.insert_one({
+                    'bot_status': True,
+                    'over_message': 'No more comments available for this app.',
+                    'buttons': []
+                })
+                settings = settings_collection.find_one()
+            
+            bot_status = settings.get('bot_status', True)
+            status_text = "ON ✅" if bot_status else "OFF ❌"
+            
+            keyboard = [
+                [InlineKeyboardButton("📢 Manage Channels", callback_data="manage_channels")],
+                [InlineKeyboardButton("🔘 Manage Buttons", callback_data="manage_buttons")],
+                [InlineKeyboardButton("➕ Add Comments", callback_data="show_buttons_for_comments")],
+                [InlineKeyboardButton("📊 View Stats", callback_data="view_stats")],
+                [InlineKeyboardButton("✏️ Set Over Message", callback_data="set_over_message")],
+                [InlineKeyboardButton("🔙 Main Menu", callback_data="back_to_main")]
+            ]
+            
+            # Add bot status button at the top
+            if bot_status:
+                keyboard.insert(0, [InlineKeyboardButton("🤖 Turn Bot OFF", callback_data="bot_off")])
+            else:
+                keyboard.insert(0, [InlineKeyboardButton("🤖 Turn Bot ON", callback_data="bot_on")])
+            
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text(
+                "⚙️ Admin Panel\n\n"
+                f"Bot Status: {status_text}\n"
+                "Select an option:",
+                reply_markup=reply_markup
+            )
+        except Exception as e:
+            print(f"Error in admin panel: {e}")
+            await update.message.reply_text(
+                "⚠️ Error loading admin panel. Please try again or check database connection."
+            )
 
     async def check_force_join_before_approval(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Check force join channels before showing approval option"""
@@ -513,33 +556,51 @@ class CommentBot:
             await query.message.reply_text("Unauthorized access!")
             return
         
-        settings = settings_collection.find_one()
-        bot_status = settings['bot_status']
-        status_text = "ON ✅" if bot_status else "OFF ❌"
-        
-        keyboard = [
-            [InlineKeyboardButton("📢 Manage Channels", callback_data="manage_channels")],
-            [InlineKeyboardButton("🔘 Manage Buttons", callback_data="manage_buttons")],
-            [InlineKeyboardButton("➕ Add Comments", callback_data="show_buttons_for_comments")],
-            [InlineKeyboardButton("📊 View Stats", callback_data="view_stats")],
-            [InlineKeyboardButton("✏️ Set Over Message", callback_data="set_over_message")],
-            [InlineKeyboardButton("🔙 Main Menu", callback_data="back_to_main")]
-        ]
-        
-        # Add bot status button at the top
-        if bot_status:
-            keyboard.insert(0, [InlineKeyboardButton("🤖 Turn Bot OFF", callback_data="bot_off")])
-        else:
-            keyboard.insert(0, [InlineKeyboardButton("🤖 Turn Bot ON", callback_data="bot_on")])
-        
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.message.edit_text(
-            "⚙️ Admin Panel\n\n"
-            f"Bot Status: {status_text}\n"
-            "Select an option:",
-            reply_markup=reply_markup
-        )
+        try:
+            # Reload settings to ensure latest
+            self.load_settings()
+            
+            settings = settings_collection.find_one()
+            if not settings:
+                # Create settings if still not exists
+                settings_collection.insert_one({
+                    'bot_status': True,
+                    'over_message': 'No more comments available for this app.',
+                    'buttons': []
+                })
+                settings = settings_collection.find_one()
+            
+            bot_status = settings.get('bot_status', True)
+            status_text = "ON ✅" if bot_status else "OFF ❌"
+            
+            keyboard = [
+                [InlineKeyboardButton("📢 Manage Channels", callback_data="manage_channels")],
+                [InlineKeyboardButton("🔘 Manage Buttons", callback_data="manage_buttons")],
+                [InlineKeyboardButton("➕ Add Comments", callback_data="show_buttons_for_comments")],
+                [InlineKeyboardButton("📊 View Stats", callback_data="view_stats")],
+                [InlineKeyboardButton("✏️ Set Over Message", callback_data="set_over_message")],
+                [InlineKeyboardButton("🔙 Main Menu", callback_data="back_to_main")]
+            ]
+            
+            # Add bot status button at the top
+            if bot_status:
+                keyboard.insert(0, [InlineKeyboardButton("🤖 Turn Bot OFF", callback_data="bot_off")])
+            else:
+                keyboard.insert(0, [InlineKeyboardButton("🤖 Turn Bot ON", callback_data="bot_on")])
+            
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.message.edit_text(
+                "⚙️ Admin Panel\n\n"
+                f"Bot Status: {status_text}\n"
+                "Select an option:",
+                reply_markup=reply_markup
+            )
+        except Exception as e:
+            print(f"Error in admin panel callback: {e}")
+            await query.message.edit_text(
+                "⚠️ Error loading admin panel. Please try again or check database connection."
+            )
 
     async def show_comment_confirmation(self, query, context, button_id):
         keyboard = [
@@ -580,8 +641,8 @@ class CommentBot:
             )
         else:
             # No comments available
-            over_message = settings_collection.find_one()['over_message']
-            await query.message.edit_text(over_message)
+            self.load_settings()  # Reload to get latest over_message
+            await query.message.edit_text(self.over_message)
 
     async def show_manage_channels(self, query, context):
         keyboard = [
