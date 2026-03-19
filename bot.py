@@ -29,13 +29,13 @@ try:
     comments = db['comments']
     settings = db['settings']
     pending = db['pending']
-    
+
     if not settings.find_one():
         settings.insert_one({'bot_status': True, 'over_message': 'No more comments available.'})
     print("✅ MongoDB connected")
 except Exception as e:
     print(f"❌ MongoDB error: {e}")
-    # Dummy collections
+    # Dummy collections to prevent crashes
     class Dummy:
         def find_one(self, *a, **k): return None
         def find(self, *a, **k): return []
@@ -48,7 +48,7 @@ except Exception as e:
 class Bot:
     def __init__(self):
         self.load_settings()
-    
+
     def load_settings(self):
         s = settings.find_one()
         self.bot_on = s.get('bot_status', True) if s else True
@@ -203,7 +203,6 @@ class Bot:
     async def add_channel_start(self, query, ctx):
         ctx.user_data['action'] = 'add_channel'
         await query.message.reply_text("Send the channel username or ID:")
-        # No need to return state; we'll handle in message handler
 
     async def remove_channel(self, query):
         chans = list(channels.find())
@@ -301,7 +300,6 @@ class Bot:
 
         # Only admins can use admin actions
         if user_id not in ADMIN_IDS:
-            # Non-admin messages: ignore or just start
             await self.start(update, ctx)
             return
 
@@ -312,13 +310,13 @@ class Bot:
         elif action == 'add_channel_link':
             name = ctx.user_data.pop('chan_name')
             link = text
-            chan_id = str(datetime.timestamp()).replace('.', '')
+            chan_id = str(datetime.now().timestamp()).replace('.', '')  # FIXED
             channels.insert_one({'channel_id': chan_id, 'channel_name': name, 'channel_link': link})
             await update.message.reply_text("✅ Channel added!")
             ctx.user_data.pop('action', None)
             await self.admin_panel(update, ctx)
         elif action == 'add_button':
-            btn_id = str(datetime.timestamp()).replace('.', '')
+            btn_id = str(datetime.now().timestamp()).replace('.', '')  # FIXED
             buttons.insert_one({'button_id': btn_id, 'button_name': text})
             await update.message.reply_text("✅ Button added!")
             ctx.user_data.pop('action', None)
@@ -339,7 +337,6 @@ class Bot:
             ctx.user_data.pop('action', None)
             await self.admin_panel(update, ctx)
         else:
-            # If no action, just show start (for admin, show admin panel)
             await self.start(update, ctx)
 
     # ========== CALLBACK HANDLER ==========
