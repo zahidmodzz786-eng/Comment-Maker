@@ -1,4 +1,3 @@
-
 import logging
 import os
 import certifi
@@ -6,16 +5,13 @@ from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, filters, ContextTypes, ConversationHandler
+    MessageHandler, filters, ContextTypes
 )
 from pymongo import MongoClient
 
 # Enable logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Conversation states
-(CHANNEL_NAME, CHANNEL_LINK, BUTTON_NAME, COMMENTS, OVER_MSG) = range(5)
 
 # Environment variables
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
@@ -33,14 +29,13 @@ try:
     comments = db['comments']
     settings = db['settings']
     pending = db['pending']
-
-    # Default settings
+    
     if not settings.find_one():
         settings.insert_one({'bot_status': True, 'over_message': 'No more comments available.'})
     print("✅ MongoDB connected")
 except Exception as e:
     print(f"❌ MongoDB error: {e}")
-    # Dummy collections to avoid crashes
+    # Dummy collections
     class Dummy:
         def find_one(self, *a, **k): return None
         def find(self, *a, **k): return []
@@ -50,10 +45,10 @@ except Exception as e:
         def count_documents(self, *a, **k): return 0
     users = channels = buttons = comments = settings = pending = Dummy()
 
-class CommentBot:
+class Bot:
     def __init__(self):
         self.load_settings()
-
+    
     def load_settings(self):
         s = settings.find_one()
         self.bot_on = s.get('bot_status', True) if s else True
@@ -64,15 +59,12 @@ class CommentBot:
         user = update.effective_user
         uid = user.id
 
-        # Admin check
         if uid in ADMIN_IDS:
             return await self.admin_panel(update, ctx)
 
-        # Bot off?
         if not self.bot_on:
             return await update.message.reply_text("No Apps Available For Comment")
 
-        # Get user status
         u = users.find_one({'user_id': uid})
         if u and u.get('approved'):
             # Show main menu
@@ -106,7 +98,7 @@ class CommentBot:
                 for ch in not_joined:
                     keyboard.append([InlineKeyboardButton(f"Join {ch['channel_name']}", url=ch['channel_link'])])
                 keyboard.append([InlineKeyboardButton("✅ I've Joined", callback_data="check_join")])
-                await update.message.reply_text("Please join these channels first:", reply_markup=InlineKeyboardMarkup(keyboard))
+                await update.message.reply_text("Please join these channels:", reply_markup=InlineKeyboardMarkup(keyboard))
             else:
                 await self.request_approval_prompt(update, ctx)
 
@@ -122,7 +114,6 @@ class CommentBot:
         user = query.from_user
         uid = user.id
 
-        # Already pending?
         if pending.find_one({'user_id': uid}):
             await query.message.edit_text("You already have a pending request. Please wait.")
             return
@@ -130,11 +121,9 @@ class CommentBot:
             await query.message.edit_text("You are already approved! Send /start")
             return
 
-        # Insert pending
         pending.insert_one({'user_id': uid, 'username': user.username, 'first_name': user.first_name, 'date': datetime.now()})
         users.update_one({'user_id': uid}, {'$set': {'pending': True}}, upsert=True)
 
-        # Notify admins
         for admin in ADMIN_IDS:
             try:
                 kb = [[InlineKeyboardButton("✅ Approve", callback_data=f"app_{uid}"),
@@ -173,13 +162,9 @@ class CommentBot:
             [InlineKeyboardButton("✅ I Agree", callback_data=f"agree_{btn_id}")],
             [InlineKeyboardButton("❌ No", callback_data="main_menu")]
         ]
-        await query.message.edit_text(
-            "Do you really want this app comment?\nNote: If you don't do 2-3 apps you may be banned.",
-            reply_markup=InlineKeyboardMarkup(kb)
-        )
+        await query.message.edit_text("Do you really want this app comment?\nNote: If you don't do 2-3 apps you may be banned.", reply_markup=InlineKeyboardMarkup(kb))
 
     async def give_comment(self, query, btn_id):
-        # Atomic: find and delete (then mark used)
         com = comments.find_one_and_delete({'button_id': btn_id, 'used': False}, sort=[('_id', 1)])
         if com:
             comments.update_one({'_id': com['_id']}, {'$set': {'used': True, 'used_by': query.from_user.id, 'used_date': datetime.now()}})
@@ -204,7 +189,7 @@ class CommentBot:
         else:
             await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
 
-    # ========== CHANNELS MANAGEMENT ==========
+    # ========== CHANNELS ==========
     async def menu_channels(self, query):
         chans = list(channels.find())
         txt = "📢 Channels:\n" + ("\n".join([f"• {c['channel_name']}" for c in chans]) if chans else "No channels.")
@@ -215,26 +200,11 @@ class CommentBot:
         ]
         await query.message.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
 
-    # Add channel conversation
     async def add_channel_start(self, query, ctx):
+        ctx.user_data['action'] = 'add_channel'
         await query.message.reply_text("Send the channel username or ID:")
-        return CHANNEL_NAME
+        # No need to return state; we'll handle in message handler
 
-    async def add_channel_name(self, update, ctx):
-        ctx.user_data['chan_name'] = update.message.text
-        await update.message.reply_text("Now send the invite link:")
-        return CHANNEL_LINK
-
-    async def add_channel_link(self, update, ctx):
-        name = ctx.user_data.pop('chan_name')
-        link = update.message.text
-        chan_id = str(datetime.timestamp()).replace('.', '')
-        channels.insert_one({'channel_id': chan_id, 'channel_name': name, 'channel_link': link})
-        await update.message.reply_text("✅ Channel added!")
-        await self.admin_panel(update, ctx)
-        return ConversationHandler.END
-
-    # Remove channel
     async def remove_channel(self, query):
         chans = list(channels.find())
         if not chans:
@@ -248,7 +218,7 @@ class CommentBot:
         channels.delete_one({'channel_id': chan_id})
         await query.message.edit_text("✅ Channel removed.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="menu_channels")]]))
 
-    # ========== BUTTONS MANAGEMENT ==========
+    # ========== BUTTONS ==========
     async def menu_buttons(self, query):
         btns = list(buttons.find())
         txt = "🔘 Buttons:\n" + ("\n".join([f"• {b['button_name']}" for b in btns]) if btns else "No buttons.")
@@ -259,20 +229,10 @@ class CommentBot:
         ]
         await query.message.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
 
-    # Add button conversation
     async def add_button_start(self, query, ctx):
+        ctx.user_data['action'] = 'add_button'
         await query.message.reply_text("Send the button name:")
-        return BUTTON_NAME
 
-    async def add_button_name(self, update, ctx):
-        name = update.message.text
-        btn_id = str(datetime.timestamp()).replace('.', '')
-        buttons.insert_one({'button_id': btn_id, 'button_name': name})
-        await update.message.reply_text("✅ Button added!")
-        await self.admin_panel(update, ctx)
-        return ConversationHandler.END
-
-    # Remove button
     async def remove_button(self, query):
         btns = list(buttons.find())
         if not btns:
@@ -298,20 +258,9 @@ class CommentBot:
         await query.message.edit_text("Select button to add comments to:", reply_markup=InlineKeyboardMarkup(kb))
 
     async def select_button_for_comments(self, query, ctx):
-        btn_id = query.data.replace("selbtn_", "")
-        ctx.user_data['com_btn'] = btn_id
+        ctx.user_data['com_btn'] = query.data.replace("selbtn_", "")
+        ctx.user_data['action'] = 'add_comments'
         await query.message.reply_text("Send comments separated by commas:\nExample: Great!, Awesome!, Love it!")
-        return COMMENTS
-
-    async def save_comments(self, update, ctx):
-        btn_id = ctx.user_data.pop('com_btn')
-        text = update.message.text
-        coms = [c.strip() for c in text.split(',') if c.strip()]
-        for c in coms:
-            comments.insert_one({'button_id': btn_id, 'comment': c, 'used': False, 'added_date': datetime.now()})
-        await update.message.reply_text(f"✅ Added {len(coms)} comments!")
-        await self.admin_panel(update, ctx)
-        return ConversationHandler.END
 
     # ========== STATS ==========
     async def menu_stats(self, query):
@@ -332,16 +281,8 @@ class CommentBot:
 
     # ========== OVER MESSAGE ==========
     async def menu_overmsg(self, query, ctx):
+        ctx.user_data['action'] = 'over_msg'
         await query.message.reply_text("Send the new 'out of comments' message:")
-        return OVER_MSG
-
-    async def save_overmsg(self, update, ctx):
-        msg = update.message.text
-        settings.update_one({}, {'$set': {'over_message': msg}}, upsert=True)
-        self.over_msg = msg
-        await update.message.reply_text("✅ Over message updated!")
-        await self.admin_panel(update, ctx)
-        return ConversationHandler.END
 
     # ========== TOGGLE BOT ==========
     async def toggle_bot(self, query):
@@ -350,9 +291,58 @@ class CommentBot:
         settings.update_one({}, {'$set': {'bot_status': new}}, upsert=True)
         self.bot_on = new
         await query.message.edit_text(f"Bot turned {'ON' if new else 'OFF'}!")
-        await self.admin_panel(query, ctx=None, edit=True)  # ctx not needed for edit
+        await self.admin_panel(query, None, edit=True)
 
-    # ========== MAIN CALLBACK HANDLER ==========
+    # ========== MESSAGE HANDLER (for all text inputs) ==========
+    async def handle_message(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        text = update.message.text
+        action = ctx.user_data.get('action')
+
+        # Only admins can use admin actions
+        if user_id not in ADMIN_IDS:
+            # Non-admin messages: ignore or just start
+            await self.start(update, ctx)
+            return
+
+        if action == 'add_channel':
+            ctx.user_data['chan_name'] = text
+            ctx.user_data['action'] = 'add_channel_link'
+            await update.message.reply_text("Now send the invite link:")
+        elif action == 'add_channel_link':
+            name = ctx.user_data.pop('chan_name')
+            link = text
+            chan_id = str(datetime.timestamp()).replace('.', '')
+            channels.insert_one({'channel_id': chan_id, 'channel_name': name, 'channel_link': link})
+            await update.message.reply_text("✅ Channel added!")
+            ctx.user_data.pop('action', None)
+            await self.admin_panel(update, ctx)
+        elif action == 'add_button':
+            btn_id = str(datetime.timestamp()).replace('.', '')
+            buttons.insert_one({'button_id': btn_id, 'button_name': text})
+            await update.message.reply_text("✅ Button added!")
+            ctx.user_data.pop('action', None)
+            await self.admin_panel(update, ctx)
+        elif action == 'add_comments':
+            btn_id = ctx.user_data.get('com_btn')
+            coms = [c.strip() for c in text.split(',') if c.strip()]
+            for c in coms:
+                comments.insert_one({'button_id': btn_id, 'comment': c, 'used': False, 'added_date': datetime.now()})
+            await update.message.reply_text(f"✅ Added {len(coms)} comments!")
+            ctx.user_data.pop('action', None)
+            ctx.user_data.pop('com_btn', None)
+            await self.admin_panel(update, ctx)
+        elif action == 'over_msg':
+            settings.update_one({}, {'$set': {'over_message': text}}, upsert=True)
+            self.over_msg = text
+            await update.message.reply_text("✅ Over message updated!")
+            ctx.user_data.pop('action', None)
+            await self.admin_panel(update, ctx)
+        else:
+            # If no action, just show start (for admin, show admin panel)
+            await self.start(update, ctx)
+
+    # ========== CALLBACK HANDLER ==========
     async def callback_handler(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
         await q.answer()
@@ -360,7 +350,6 @@ class CommentBot:
 
         # Public callbacks
         if data == "check_join":
-            # Re-run start to recheck channels
             await self.start(q, ctx)
             return
         if data == "ask_approval":
@@ -376,7 +365,6 @@ class CommentBot:
             await self.give_comment(q, data[6:])
             return
         if data == "main_menu":
-            # Show main menu for approved users
             btns = list(buttons.find())
             if not btns:
                 await q.message.edit_text("No apps yet.")
@@ -385,7 +373,7 @@ class CommentBot:
             await q.message.edit_text("Select an app:", reply_markup=InlineKeyboardMarkup(kb))
             return
 
-        # Admin only beyond this point
+        # Admin only beyond
         if q.from_user.id not in ADMIN_IDS:
             await q.message.reply_text("Unauthorized")
             return
@@ -405,8 +393,8 @@ class CommentBot:
             await self.menu_channels(q)
             return
         if data == "add_channel":
-            # Start conversation
-            return await self.add_channel_start(q, ctx)
+            await self.add_channel_start(q, ctx)
+            return
         if data == "remove_channel":
             await self.remove_channel(q)
             return
@@ -419,7 +407,8 @@ class CommentBot:
             await self.menu_buttons(q)
             return
         if data == "add_button":
-            return await self.add_button_start(q, ctx)
+            await self.add_button_start(q, ctx)
+            return
         if data == "remove_button":
             await self.remove_button(q)
             return
@@ -432,9 +421,8 @@ class CommentBot:
             await self.menu_add_comments(q)
             return
         if data.startswith("selbtn_"):
-            ctx.user_data['com_btn'] = data[7:]
-            await q.message.reply_text("Send comments separated by commas:")
-            return COMMENTS
+            await self.select_button_for_comments(q, ctx)
+            return
 
         # Stats
         if data == "menu_stats":
@@ -446,61 +434,20 @@ class CommentBot:
 
         # Over message
         if data == "menu_overmsg":
-            return await self.menu_overmsg(q, ctx)
-
-    # ========== CANCEL ==========
-    async def cancel(self, update, ctx):
-        await update.message.reply_text("Operation cancelled.")
-        return ConversationHandler.END
+            await self.menu_overmsg(q, ctx)
+            return
 
 # ========== MAIN ==========
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
-    bot = CommentBot()
-
-    # Conversation handlers
-    chan_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(bot.add_channel_start, pattern="^add_channel$")],
-        states={
-            CHANNEL_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot.add_channel_name)],
-            CHANNEL_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot.add_channel_link)]
-        },
-        fallbacks=[CommandHandler("cancel", bot.cancel)]
-    )
-    btn_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(bot.add_button_start, pattern="^add_button$")],
-        states={
-            BUTTON_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot.add_button_name)]
-        },
-        fallbacks=[CommandHandler("cancel", bot.cancel)]
-    )
-    com_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(bot.menu_add_comments, pattern="^menu_add_comments$")],
-        states={
-            COMMENTS: [
-                CallbackQueryHandler(bot.select_button_for_comments, pattern="^selbtn_"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, bot.save_comments)
-            ]
-        },
-        fallbacks=[CommandHandler("cancel", bot.cancel)]
-    )
-    over_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(bot.menu_overmsg, pattern="^menu_overmsg$")],
-        states={
-            OVER_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot.save_overmsg)]
-        },
-        fallbacks=[CommandHandler("cancel", bot.cancel)]
-    )
+    bot = Bot()
 
     app.add_handler(CommandHandler("start", bot.start))
     app.add_handler(CommandHandler("admin", bot.admin_panel))
     app.add_handler(CallbackQueryHandler(bot.callback_handler))
-    app.add_handler(chan_conv)
-    app.add_handler(btn_conv)
-    app.add_handler(com_conv)
-    app.add_handler(over_conv)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
 
-    print("🤖 Bot is running...")
+    print("🤖 Bot running...")
     app.run_polling()
 
 if __name__ == "__main__":
