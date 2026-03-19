@@ -7,6 +7,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 from pymongo import MongoClient
 from datetime import datetime
 import asyncio
+import traceback
 
 # Enable logging
 logging.basicConfig(
@@ -21,6 +22,9 @@ WAITING_FOR_CHANNEL, WAITING_FOR_BUTTON_NAME, WAITING_FOR_COMMENTS, WAITING_FOR_
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 ADMIN_IDS = list(map(int, os.environ.get('ADMIN_IDS', '').split(',')))
 MONGO_URI = os.environ.get('MONGO_URI')
+
+print(f"🔧 Starting bot with Admin IDs: {ADMIN_IDS}")
+print(f"🔧 MongoDB URI: {MONGO_URI[:50]}...")  # Print first 50 chars only for security
 
 # Initialize MongoDB with SSL fix
 try:
@@ -53,6 +57,8 @@ try:
             'buttons': []
         })
         print("✅ Default settings created!")
+    else:
+        print("✅ Settings already exist in database")
         
 except Exception as e:
     print(f"❌ MongoDB connection failed: {e}")
@@ -85,7 +91,9 @@ class CommentBot:
             if settings:
                 self.bot_status = settings.get('bot_status', True)
                 self.over_message = settings.get('over_message', 'No more comments available for this app.')
+                print(f"✅ Settings loaded: bot_status={self.bot_status}")
             else:
+                print("⚠️ No settings found, creating default...")
                 # Create default settings if not exists
                 settings_collection.insert_one({
                     'bot_status': True,
@@ -97,12 +105,15 @@ class CommentBot:
                 print("✅ Created default settings in __init__")
         except Exception as e:
             print(f"⚠️ Error loading settings: {e}")
+            traceback.print_exc()
             self.bot_status = True
             self.over_message = 'No more comments available for this app.'
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
         user_id = user.id
+        
+        print(f"👤 User {user_id} (@{user.username}) started the bot")
         
         # Reload settings to ensure latest status
         self.load_settings()
@@ -114,25 +125,34 @@ class CommentBot:
         
         # Check if user is admin
         if user_id in ADMIN_IDS:
+            print(f"👑 Admin {user_id} accessed bot")
             await self.show_admin_panel_direct(update, context)
             return
         
         # Check if user is approved
-        user_data = users_collection.find_one({'user_id': user_id})
+        try:
+            user_data = users_collection.find_one({'user_id': user_id})
+        except Exception as e:
+            print(f"❌ Error checking user data: {e}")
+            user_data = None
         
         if user_data and user_data.get('approved', False):
+            print(f"✅ Approved user {user_id} accessing bot")
             # Show main menu
             await self.show_main_menu(update, context)
         elif user_data and user_data.get('rejected', False):
+            print(f"❌ Rejected user {user_id} tried to access")
             await update.message.reply_text(
                 "Sorry But Your Approval Has Been Rejected By Owner. "
                 "If You Have Any Issue Contact To @DTXZAHID"
             )
         elif user_data and user_data.get('pending', False):
+            print(f"⏳ Pending user {user_id} tried to access")
             await update.message.reply_text(
                 "Your approval request is already pending. Please wait for admin response."
             )
         else:
+            print(f"🆕 New user {user_id} started bot")
             # Check force join channels first
             await self.check_force_join_before_approval(update, context)
 
@@ -140,29 +160,44 @@ class CommentBot:
         """Handle /admin command"""
         user_id = update.effective_user.id
         
+        print(f"👑 User {user_id} used /admin command")
+        
         if user_id in ADMIN_IDS:
             await self.show_admin_panel_direct(update, context)
         else:
+            print(f"⛔ Non-admin {user_id} tried to use /admin")
             await update.message.reply_text("⛔ Unauthorized! This command is for admins only.")
 
     async def show_admin_panel_direct(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show admin panel directly without requiring main menu"""
         try:
+            print("🔄 Loading admin panel directly...")
+            
             # Reload settings to ensure latest
             self.load_settings()
             
-            settings = settings_collection.find_one()
-            if not settings:
-                # Create settings if still not exists
-                settings_collection.insert_one({
-                    'bot_status': True,
-                    'over_message': 'No more comments available for this app.',
-                    'buttons': []
-                })
+            # Try to get settings from database
+            try:
                 settings = settings_collection.find_one()
+                if not settings:
+                    print("⚠️ No settings found in database, creating...")
+                    # Create settings if still not exists
+                    settings_collection.insert_one({
+                        'bot_status': True,
+                        'over_message': 'No more comments available for this app.',
+                        'buttons': []
+                    })
+                    settings = settings_collection.find_one()
+                    print("✅ Settings created successfully")
+            except Exception as e:
+                print(f"❌ Error accessing settings: {e}")
+                traceback.print_exc()
+                settings = {'bot_status': True, 'over_message': 'Default message'}
             
             bot_status = settings.get('bot_status', True)
             status_text = "ON ✅" if bot_status else "OFF ❌"
+            
+            print(f"📊 Admin panel loaded with status: {status_text}")
             
             keyboard = [
                 [InlineKeyboardButton("📢 Manage Channels", callback_data="manage_channels")],
@@ -187,15 +222,33 @@ class CommentBot:
                 "Select an option:",
                 reply_markup=reply_markup
             )
+            print("✅ Admin panel displayed successfully")
+            
         except Exception as e:
-            print(f"Error in admin panel: {e}")
+            print(f"❌ Error in admin panel: {e}")
+            traceback.print_exc()
+            # Fallback simple admin panel
+            keyboard = [
+                [InlineKeyboardButton("📢 Manage Channels", callback_data="manage_channels")],
+                [InlineKeyboardButton("🔘 Manage Buttons", callback_data="manage_buttons")],
+                [InlineKeyboardButton("🔙 Main Menu", callback_data="back_to_main")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
             await update.message.reply_text(
-                "⚠️ Error loading admin panel. Please try again or check database connection."
+                "⚙️ Admin Panel (Limited Mode)\n\n"
+                "Some features may be unavailable due to database issues.\n"
+                "Please check MongoDB connection.",
+                reply_markup=reply_markup
             )
 
     async def check_force_join_before_approval(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Check force join channels before showing approval option"""
-        channels = list(channels_collection.find())
+        try:
+            channels = list(channels_collection.find())
+        except Exception as e:
+            print(f"❌ Error getting channels: {e}")
+            channels = []
         
         if not channels:
             # No channels to join, show approval option
@@ -210,7 +263,8 @@ class CommentBot:
                 member = await context.bot.get_chat_member(chat_id=channel['channel_id'], user_id=user_id)
                 if member.status not in ['member', 'administrator', 'creator']:
                     not_joined.append(channel)
-            except:
+            except Exception as e:
+                print(f"⚠️ Error checking channel {channel.get('channel_name')}: {e}")
                 not_joined.append(channel)
         
         if not_joined:
@@ -237,7 +291,12 @@ class CommentBot:
         user = update.effective_user
         
         # Check if already pending
-        existing = pending_approvals_collection.find_one({'user_id': user.id})
+        try:
+            existing = pending_approvals_collection.find_one({'user_id': user.id})
+        except Exception as e:
+            print(f"❌ Error checking pending approvals: {e}")
+            existing = None
+        
         if existing:
             await update.message.reply_text(
                 "Your approval request is already pending. Please wait for admin response."
@@ -245,7 +304,12 @@ class CommentBot:
             return
         
         # Check if already approved
-        user_data = users_collection.find_one({'user_id': user.id})
+        try:
+            user_data = users_collection.find_one({'user_id': user.id})
+        except Exception as e:
+            print(f"❌ Error checking user data: {e}")
+            user_data = None
+            
         if user_data and user_data.get('approved', False):
             await self.show_main_menu(update, context)
             return
@@ -275,8 +339,15 @@ class CommentBot:
         """Handle approval request from user"""
         user = query.from_user
         
+        print(f"📨 User {user.id} requested approval")
+        
         # Check if already pending
-        existing = pending_approvals_collection.find_one({'user_id': user.id})
+        try:
+            existing = pending_approvals_collection.find_one({'user_id': user.id})
+        except Exception as e:
+            print(f"❌ Error checking pending: {e}")
+            existing = None
+            
         if existing:
             await query.message.edit_text(
                 "Your approval request is already pending. Please wait for admin response."
@@ -284,29 +355,41 @@ class CommentBot:
             return
         
         # Check if already approved
-        user_data = users_collection.find_one({'user_id': user.id})
+        try:
+            user_data = users_collection.find_one({'user_id': user.id})
+        except Exception as e:
+            print(f"❌ Error checking user: {e}")
+            user_data = None
+            
         if user_data and user_data.get('approved', False):
             await query.message.edit_text("You are already approved! Send /start to use the bot.")
             return
         
         # Save pending approval
-        pending_approvals_collection.insert_one({
-            'user_id': user.id,
-            'username': user.username,
-            'first_name': user.first_name,
-            'last_name': user.last_name,
-            'date': datetime.now(),
-            'status': 'pending'
-        })
-        
-        # Update user status
-        users_collection.update_one(
-            {'user_id': user.id},
-            {'$set': {'pending': True}},
-            upsert=True
-        )
+        try:
+            pending_approvals_collection.insert_one({
+                'user_id': user.id,
+                'username': user.username,
+                'first_name': user.first_name,
+                'last_name': user.last_name,
+                'date': datetime.now(),
+                'status': 'pending'
+            })
+            
+            # Update user status
+            users_collection.update_one(
+                {'user_id': user.id},
+                {'$set': {'pending': True}},
+                upsert=True
+            )
+            print(f"✅ Saved pending approval for user {user.id}")
+        except Exception as e:
+            print(f"❌ Error saving pending approval: {e}")
+            await query.message.edit_text("❌ Error sending request. Please try again later.")
+            return
         
         # Notify admins
+        admin_notified = False
         for admin_id in ADMIN_IDS:
             try:
                 keyboard = [
@@ -324,14 +407,21 @@ class CommentBot:
                          f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
                     reply_markup=reply_markup
                 )
+                admin_notified = True
+                print(f"✅ Notified admin {admin_id}")
             except Exception as e:
-                print(f"Failed to notify admin {admin_id}: {e}")
-                pass
+                print(f"❌ Failed to notify admin {admin_id}: {e}")
         
-        await query.message.edit_text(
-            "✅ Your approval request has been sent to admin!\n\n"
-            "Please wait for response. You'll be notified once approved."
-        )
+        if admin_notified:
+            await query.message.edit_text(
+                "✅ Your approval request has been sent to admin!\n\n"
+                "Please wait for response. You'll be notified once approved."
+            )
+        else:
+            await query.message.edit_text(
+                "⚠️ Your request was saved but couldn't notify admins.\n"
+                "Please contact @DTXZAHID directly."
+            )
 
     async def handle_approval(self, query, context):
         """Handle admin approval/rejection"""
@@ -342,18 +432,24 @@ class CommentBot:
         data = query.data
         user_id = int(data.split('_')[1])
         
+        print(f"👑 Admin {query.from_user.id} is handling user {user_id}: {data}")
+        
         if data.startswith("approve"):
             # Approve user
-            users_collection.update_one(
-                {'user_id': user_id},
-                {'$set': {
-                    'approved': True, 
-                    'rejected': False,
-                    'pending': False
-                }},
-                upsert=True
-            )
-            pending_approvals_collection.delete_one({'user_id': user_id})
+            try:
+                users_collection.update_one(
+                    {'user_id': user_id},
+                    {'$set': {
+                        'approved': True, 
+                        'rejected': False,
+                        'pending': False
+                    }},
+                    upsert=True
+                )
+                pending_approvals_collection.delete_one({'user_id': user_id})
+                print(f"✅ User {user_id} approved in database")
+            except Exception as e:
+                print(f"❌ Error approving user in DB: {e}")
             
             # Notify user
             try:
@@ -363,24 +459,29 @@ class CommentBot:
                          "Your approval request has been accepted!\n"
                          "Send /start to begin using the bot."
                 )
+                print(f"✅ Notified user {user_id} of approval")
             except Exception as e:
-                print(f"Failed to notify user {user_id}: {e}")
+                print(f"❌ Failed to notify user {user_id}: {e}")
             
             await query.message.edit_text(
                 query.message.text + "\n\n✅ User approved successfully!"
             )
         else:
             # Reject user
-            users_collection.update_one(
-                {'user_id': user_id},
-                {'$set': {
-                    'approved': False, 
-                    'rejected': True,
-                    'pending': False
-                }},
-                upsert=True
-            )
-            pending_approvals_collection.delete_one({'user_id': user_id})
+            try:
+                users_collection.update_one(
+                    {'user_id': user_id},
+                    {'$set': {
+                        'approved': False, 
+                        'rejected': True,
+                        'pending': False
+                    }},
+                    upsert=True
+                )
+                pending_approvals_collection.delete_one({'user_id': user_id})
+                print(f"✅ User {user_id} rejected in database")
+            except Exception as e:
+                print(f"❌ Error rejecting user in DB: {e}")
             
             # Notify user
             try:
@@ -389,8 +490,9 @@ class CommentBot:
                     text="❌ Sorry But Your Approval Has Been Rejected By Owner.\n\n"
                          "If You Have Any Issue Contact To @DTXZAHID"
                 )
+                print(f"✅ Notified user {user_id} of rejection")
             except Exception as e:
-                print(f"Failed to notify user {user_id}: {e}")
+                print(f"❌ Failed to notify user {user_id}: {e}")
             
             await query.message.edit_text(
                 query.message.text + "\n\n❌ User rejected!"
@@ -401,6 +503,9 @@ class CommentBot:
         await query.answer()
         
         data = query.data
+        user_id = query.from_user.id
+        
+        print(f"🔄 Callback from user {user_id}: {data}")
         
         if data == "request_approval":
             await self.request_approval_handler(query, context)
@@ -428,7 +533,6 @@ class CommentBot:
                 "Comment 1, Comment 2, Comment 3, ...\n\n"
                 "You can send as many comments as you want separated by commas."
             )
-            return WAITING_FOR_COMMENTS
         elif data.startswith("stats_"):
             button_id = data.replace("stats_", "")
             await self.show_button_stats(query, context, button_id)
@@ -443,14 +547,22 @@ class CommentBot:
         elif data == "remove_button":
             await self.show_buttons_to_remove(query, context)
         elif data == "bot_on":
-            settings_collection.update_one({}, {'$set': {'bot_status': True}})
-            self.bot_status = True
-            await query.message.edit_text("Bot turned ON successfully!")
+            try:
+                settings_collection.update_one({}, {'$set': {'bot_status': True}})
+                self.bot_status = True
+                await query.message.edit_text("Bot turned ON successfully!")
+            except Exception as e:
+                print(f"❌ Error turning bot on: {e}")
+                await query.message.edit_text("❌ Error turning bot on. Check database.")
             await self.show_admin_panel(query, context)
         elif data == "bot_off":
-            settings_collection.update_one({}, {'$set': {'bot_status': False}})
-            self.bot_status = False
-            await query.message.edit_text("Bot turned OFF successfully!")
+            try:
+                settings_collection.update_one({}, {'$set': {'bot_status': False}})
+                self.bot_status = False
+                await query.message.edit_text("Bot turned OFF successfully!")
+            except Exception as e:
+                print(f"❌ Error turning bot off: {e}")
+                await query.message.edit_text("❌ Error turning bot off. Check database.")
             await self.show_admin_panel(query, context)
         elif data == "set_over_message":
             await query.message.reply_text("Please send the new over message:")
@@ -467,20 +579,33 @@ class CommentBot:
             await self.show_main_menu_from_callback(query, context)
         elif data.startswith("remove_channel_"):
             channel_id = data.replace("remove_channel_", "")
-            channels_collection.delete_one({'channel_id': channel_id})
-            await query.message.edit_text("✅ Channel removed successfully!")
+            try:
+                channels_collection.delete_one({'channel_id': channel_id})
+                await query.message.edit_text("✅ Channel removed successfully!")
+            except Exception as e:
+                print(f"❌ Error removing channel: {e}")
+                await query.message.edit_text("❌ Error removing channel.")
             await self.show_manage_channels(query, context)
         elif data.startswith("remove_button_"):
             button_id = data.replace("remove_button_", "")
-            buttons_collection.delete_one({'button_id': button_id})
-            # Also remove related comments
-            comments_collection.delete_many({'button_id': button_id})
-            await query.message.edit_text("✅ Button removed successfully!")
+            try:
+                buttons_collection.delete_one({'button_id': button_id})
+                # Also remove related comments
+                comments_collection.delete_many({'button_id': button_id})
+                await query.message.edit_text("✅ Button removed successfully!")
+            except Exception as e:
+                print(f"❌ Error removing button: {e}")
+                await query.message.edit_text("❌ Error removing button.")
             await self.show_manage_buttons(query, context)
 
     async def check_join_before_approval(self, query, context):
         """Check if user has joined all channels before showing approval option"""
-        channels = list(channels_collection.find())
+        try:
+            channels = list(channels_collection.find())
+        except Exception as e:
+            print(f"❌ Error getting channels: {e}")
+            channels = []
+            
         user_id = query.from_user.id
         not_joined = []
         
@@ -489,7 +614,8 @@ class CommentBot:
                 member = await context.bot.get_chat_member(chat_id=channel['channel_id'], user_id=user_id)
                 if member.status not in ['member', 'administrator', 'creator']:
                     not_joined.append(channel)
-            except:
+            except Exception as e:
+                print(f"⚠️ Error checking channel: {e}")
                 not_joined.append(channel)
         
         if not_joined:
@@ -522,7 +648,11 @@ class CommentBot:
 
     async def show_main_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show main menu with buttons for approved users"""
-        buttons = list(buttons_collection.find())
+        try:
+            buttons = list(buttons_collection.find())
+        except Exception as e:
+            print(f"❌ Error getting buttons: {e}")
+            buttons = []
         
         if not buttons:
             message = update.message if update.message else update.callback_query.message
@@ -557,21 +687,33 @@ class CommentBot:
             return
         
         try:
+            print("🔄 Loading admin panel from callback...")
+            
             # Reload settings to ensure latest
             self.load_settings()
             
-            settings = settings_collection.find_one()
-            if not settings:
-                # Create settings if still not exists
-                settings_collection.insert_one({
-                    'bot_status': True,
-                    'over_message': 'No more comments available for this app.',
-                    'buttons': []
-                })
+            # Try to get settings from database
+            try:
                 settings = settings_collection.find_one()
+                if not settings:
+                    print("⚠️ No settings found in database, creating...")
+                    # Create settings if still not exists
+                    settings_collection.insert_one({
+                        'bot_status': True,
+                        'over_message': 'No more comments available for this app.',
+                        'buttons': []
+                    })
+                    settings = settings_collection.find_one()
+                    print("✅ Settings created successfully")
+            except Exception as e:
+                print(f"❌ Error accessing settings: {e}")
+                traceback.print_exc()
+                settings = {'bot_status': True, 'over_message': 'Default message'}
             
             bot_status = settings.get('bot_status', True)
             status_text = "ON ✅" if bot_status else "OFF ❌"
+            
+            print(f"📊 Admin panel loaded with status: {status_text}")
             
             keyboard = [
                 [InlineKeyboardButton("📢 Manage Channels", callback_data="manage_channels")],
@@ -596,11 +738,27 @@ class CommentBot:
                 "Select an option:",
                 reply_markup=reply_markup
             )
+            print("✅ Admin panel displayed successfully from callback")
+            
         except Exception as e:
-            print(f"Error in admin panel callback: {e}")
+            print(f"❌ Error in admin panel callback: {e}")
+            traceback.print_exc()
+            # Fallback simple admin panel
+            keyboard = [
+                [InlineKeyboardButton("📢 Manage Channels", callback_data="manage_channels")],
+                [InlineKeyboardButton("🔘 Manage Buttons", callback_data="manage_buttons")],
+                [InlineKeyboardButton("🔙 Main Menu", callback_data="back_to_main")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
             await query.message.edit_text(
-                "⚠️ Error loading admin panel. Please try again or check database connection."
+                "⚙️ Admin Panel (Limited Mode)\n\n"
+                "Some features may be unavailable due to database issues.\n"
+                "Please check MongoDB connection.",
+                reply_markup=reply_markup
             )
+
+    # ... (rest of the methods remain the same as before - show_comment_confirmation, provide_comment, show_manage_channels, etc.)
 
     async def show_comment_confirmation(self, query, context, button_id):
         keyboard = [
@@ -617,21 +775,29 @@ class CommentBot:
 
     async def provide_comment(self, query, context, button_id):
         # Get next available comment - ATOMIC operation prevents duplicates
-        comment = comments_collection.find_one_and_delete(
-            {'button_id': button_id, 'used': False},
-            sort=[('_id', 1)]
-        )
+        try:
+            comment = comments_collection.find_one_and_delete(
+                {'button_id': button_id, 'used': False},
+                sort=[('_id', 1)]
+            )
+        except Exception as e:
+            print(f"❌ Error getting comment: {e}")
+            await query.message.edit_text("❌ Error getting comment. Please try again.")
+            return
         
         if comment:
             # Mark as used and track who got it
-            comments_collection.update_one(
-                {'_id': comment['_id']},
-                {'$set': {
-                    'used': True, 
-                    'used_by': query.from_user.id, 
-                    'used_date': datetime.now()
-                }}
-            )
+            try:
+                comments_collection.update_one(
+                    {'_id': comment['_id']},
+                    {'$set': {
+                        'used': True, 
+                        'used_by': query.from_user.id, 
+                        'used_date': datetime.now()
+                    }}
+                )
+            except Exception as e:
+                print(f"❌ Error marking comment as used: {e}")
             
             message_text = f"Here Is Your Comment Go And Do Review\n\n<code>{comment['comment']}</code>"
             
@@ -652,9 +818,14 @@ class CommentBot:
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        channels = list(channels_collection.find())
+        try:
+            channels = list(channels_collection.find())
+        except Exception as e:
+            print(f"❌ Error getting channels: {e}")
+            channels = []
+        
         channel_list = "No channels added yet." if not channels else "\n".join([
-            f"• {c['channel_name']} ({c['channel_id']})" for c in channels
+            f"• {c.get('channel_name', 'Unknown')} ({c.get('channel_id', 'No ID')})" for c in channels
         ])
         
         await query.message.edit_text(
@@ -670,9 +841,14 @@ class CommentBot:
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        buttons = list(buttons_collection.find())
+        try:
+            buttons = list(buttons_collection.find())
+        except Exception as e:
+            print(f"❌ Error getting buttons: {e}")
+            buttons = []
+        
         button_list = "No buttons added yet." if not buttons else "\n".join([
-            f"• {b['button_name']}" for b in buttons
+            f"• {b.get('button_name', 'Unknown')}" for b in buttons
         ])
         
         await query.message.edit_text(
@@ -681,7 +857,11 @@ class CommentBot:
         )
 
     async def show_buttons_for_comments(self, query, context):
-        buttons = list(buttons_collection.find())
+        try:
+            buttons = list(buttons_collection.find())
+        except Exception as e:
+            print(f"❌ Error getting buttons: {e}")
+            buttons = []
         
         if not buttons:
             await query.message.edit_text(
@@ -695,8 +875,8 @@ class CommentBot:
         keyboard = []
         for button in buttons:
             keyboard.append([InlineKeyboardButton(
-                button['button_name'], 
-                callback_data=f"add_comments_{button['button_id']}"
+                button.get('button_name', 'Unknown'), 
+                callback_data=f"add_comments_{button.get('button_id', '')}"
             )])
         
         keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="admin_panel")])
@@ -708,17 +888,22 @@ class CommentBot:
         )
 
     async def show_button_stats(self, query, context, button_id):
-        button = buttons_collection.find_one({'button_id': button_id})
-        if not button:
-            await query.message.edit_text("Button not found!")
+        try:
+            button = buttons_collection.find_one({'button_id': button_id})
+            if not button:
+                await query.message.edit_text("Button not found!")
+                return
+                
+            total_comments = comments_collection.count_documents({'button_id': button_id})
+            used_comments = comments_collection.count_documents({'button_id': button_id, 'used': True})
+            available_comments = total_comments - used_comments
+        except Exception as e:
+            print(f"❌ Error getting stats: {e}")
+            await query.message.edit_text("❌ Error getting stats. Check database.")
             return
-            
-        total_comments = comments_collection.count_documents({'button_id': button_id})
-        used_comments = comments_collection.count_documents({'button_id': button_id, 'used': True})
-        available_comments = total_comments - used_comments
         
         stats_text = (
-            f"📊 Stats for: {button['button_name']}\n\n"
+            f"📊 Stats for: {button.get('button_name', 'Unknown')}\n\n"
             f"Total Comments: {total_comments}\n"
             f"Used Comments: {used_comments}\n"
             f"Available: {available_comments}"
@@ -732,7 +917,11 @@ class CommentBot:
         )
 
     async def show_view_stats(self, query, context):
-        buttons = list(buttons_collection.find())
+        try:
+            buttons = list(buttons_collection.find())
+        except Exception as e:
+            print(f"❌ Error getting buttons: {e}")
+            buttons = []
         
         if not buttons:
             await query.message.edit_text(
@@ -746,8 +935,8 @@ class CommentBot:
         keyboard = []
         for button in buttons:
             keyboard.append([InlineKeyboardButton(
-                f"{button['button_name']}", 
-                callback_data=f"stats_{button['button_id']}"
+                button.get('button_name', 'Unknown'), 
+                callback_data=f"stats_{button.get('button_id', '')}"
             )])
         
         keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="admin_panel")])
@@ -759,7 +948,11 @@ class CommentBot:
         )
 
     async def show_channels_to_remove(self, query, context):
-        channels = list(channels_collection.find())
+        try:
+            channels = list(channels_collection.find())
+        except Exception as e:
+            print(f"❌ Error getting channels: {e}")
+            channels = []
         
         if not channels:
             await query.message.edit_text(
@@ -773,8 +966,8 @@ class CommentBot:
         keyboard = []
         for channel in channels:
             keyboard.append([InlineKeyboardButton(
-                f"Remove {channel['channel_name']}", 
-                callback_data=f"remove_channel_{channel['channel_id']}"
+                f"Remove {channel.get('channel_name', 'Unknown')}", 
+                callback_data=f"remove_channel_{channel.get('channel_id', '')}"
             )])
         
         keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="manage_channels")])
@@ -786,7 +979,11 @@ class CommentBot:
         )
 
     async def show_buttons_to_remove(self, query, context):
-        buttons = list(buttons_collection.find())
+        try:
+            buttons = list(buttons_collection.find())
+        except Exception as e:
+            print(f"❌ Error getting buttons: {e}")
+            buttons = []
         
         if not buttons:
             await query.message.edit_text(
@@ -800,8 +997,8 @@ class CommentBot:
         keyboard = []
         for button in buttons:
             keyboard.append([InlineKeyboardButton(
-                f"Remove {button['button_name']}", 
-                callback_data=f"remove_button_{button['button_id']}"
+                f"Remove {button.get('button_name', 'Unknown')}", 
+                callback_data=f"remove_button_{button.get('button_id', '')}"
             )])
         
         keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="manage_buttons")])
@@ -813,7 +1010,11 @@ class CommentBot:
         )
 
     async def show_main_menu_from_callback(self, query, context):
-        buttons = list(buttons_collection.find())
+        try:
+            buttons = list(buttons_collection.find())
+        except Exception as e:
+            print(f"❌ Error getting buttons: {e}")
+            buttons = []
         
         if not buttons:
             await query.message.edit_text(
@@ -824,8 +1025,8 @@ class CommentBot:
         keyboard = []
         for button in buttons:
             keyboard.append([InlineKeyboardButton(
-                button['button_name'], 
-                callback_data=f"button_{button['button_id']}"
+                button.get('button_name', 'Unknown'), 
+                callback_data=f"button_{button.get('button_id', '')}"
             )])
         
         if query.from_user.id in ADMIN_IDS:
@@ -841,6 +1042,8 @@ class CommentBot:
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         
+        print(f"📝 Message from user {user_id}: {update.message.text[:50]}...")
+        
         if 'current_button' in context.user_data:
             # Adding comments
             button_id = context.user_data['current_button']
@@ -850,18 +1053,23 @@ class CommentBot:
             comments = [c.strip() for c in text.split(',') if c.strip()]
             
             # Save comments
+            saved_count = 0
             for comment in comments:
-                comments_collection.insert_one({
-                    'button_id': button_id,
-                    'comment': comment,
-                    'used': False,
-                    'added_date': datetime.now()
-                })
+                try:
+                    comments_collection.insert_one({
+                        'button_id': button_id,
+                        'comment': comment,
+                        'used': False,
+                        'added_date': datetime.now()
+                    })
+                    saved_count += 1
+                except Exception as e:
+                    print(f"❌ Error saving comment: {e}")
             
             del context.user_data['current_button']
             
             await update.message.reply_text(
-                f"✅ Added {len(comments)} comments successfully!\n\n"
+                f"✅ Added {saved_count} comments successfully!\n\n"
                 f"Comments: {', '.join(comments[:5])}{'...' if len(comments) > 5 else ''}"
             )
             
@@ -884,16 +1092,20 @@ class CommentBot:
             # Generate a unique ID
             channel_id = str(datetime.timestamp()).replace('.', '')
             
-            channels_collection.insert_one({
-                'channel_id': channel_id,
-                'channel_name': channel_input,
-                'channel_link': channel_link
-            })
+            try:
+                channels_collection.insert_one({
+                    'channel_id': channel_id,
+                    'channel_name': channel_input,
+                    'channel_link': channel_link
+                })
+                await update.message.reply_text("✅ Channel added successfully!")
+            except Exception as e:
+                print(f"❌ Error saving channel: {e}")
+                await update.message.reply_text("❌ Error saving channel. Check database.")
             
             del context.user_data['channel_input']
             del context.user_data['waiting_for_channel_link']
             
-            await update.message.reply_text("✅ Channel added successfully!")
             await self.show_admin_panel_from_message(update, context)
         
         elif context.user_data.get('waiting_for_button_name'):
@@ -903,29 +1115,38 @@ class CommentBot:
             # Generate a unique ID
             button_id = str(datetime.timestamp()).replace('.', '')
             
-            buttons_collection.insert_one({
-                'button_id': button_id,
-                'button_name': button_name
-            })
+            try:
+                buttons_collection.insert_one({
+                    'button_id': button_id,
+                    'button_name': button_name
+                })
+                await update.message.reply_text("✅ Button added successfully!")
+            except Exception as e:
+                print(f"❌ Error saving button: {e}")
+                await update.message.reply_text("❌ Error saving button. Check database.")
             
             del context.user_data['waiting_for_button_name']
             
-            await update.message.reply_text("✅ Button added successfully!")
             await self.show_admin_panel_from_message(update, context)
         
         elif context.user_data.get('waiting_for_over_message'):
             # Set over message
             over_message = update.message.text
             
-            settings_collection.update_one(
-                {},
-                {'$set': {'over_message': over_message}}
-            )
-            self.over_message = over_message
+            try:
+                settings_collection.update_one(
+                    {},
+                    {'$set': {'over_message': over_message}},
+                    upsert=True
+                )
+                self.over_message = over_message
+                await update.message.reply_text("✅ Over message updated successfully!")
+            except Exception as e:
+                print(f"❌ Error saving over message: {e}")
+                await update.message.reply_text("❌ Error saving over message. Check database.")
             
             del context.user_data['waiting_for_over_message']
             
-            await update.message.reply_text("✅ Over message updated successfully!")
             await self.show_admin_panel_from_message(update, context)
         
         else:
@@ -959,7 +1180,7 @@ def main():
     
     # Add handlers
     application.add_handler(CommandHandler("start", bot.start))
-    application.add_handler(CommandHandler("admin", bot.admin_command))  # New /admin command
+    application.add_handler(CommandHandler("admin", bot.admin_command))
     application.add_handler(CallbackQueryHandler(bot.button_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
     
@@ -967,6 +1188,8 @@ def main():
     print("🤖 Bot is starting...")
     print(f"✅ Admin IDs: {ADMIN_IDS}")
     print(f"✅ Use /admin command to access admin panel")
+    print("✅ Bot is now running! Press Ctrl+C to stop.")
+    
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
