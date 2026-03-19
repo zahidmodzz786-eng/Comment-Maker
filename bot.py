@@ -1,1256 +1,416 @@
 import logging
-import json
 import os
 import certifi
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
-from pymongo import MongoClient
 from datetime import datetime
-import asyncio
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler, 
+    MessageHandler, filters, ContextTypes, ConversationHandler
+)
+from pymongo import MongoClient
 import traceback
 
 # Enable logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
-)
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# States for conversation handlers
-WAITING_FOR_CHANNEL, WAITING_FOR_BUTTON_NAME, WAITING_FOR_COMMENTS, WAITING_FOR_OVER_MESSAGE = range(4)
+# Conversation states
+(CHANNEL_NAME, CHANNEL_LINK, BUTTON_NAME, COMMENTS, OVER_MESSAGE) = range(5)
 
-# Get environment variables
+# Environment variables
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 ADMIN_IDS = list(map(int, os.environ.get('ADMIN_IDS', '').split(',')))
 MONGO_URI = os.environ.get('MONGO_URI')
 
-print(f"🔧 Starting bot with Admin IDs: {ADMIN_IDS}")
-print(f"🔧 MongoDB URI: {MONGO_URI[:50]}...")  # Print first 50 chars only for security
-
-# Initialize MongoDB with SSL fix
+# MongoDB connection
 try:
-    # Create client with certifi for SSL certificates
-    client = MongoClient(
-        MONGO_URI,
-        tlsCAFile=certifi.where(),  # This fixes SSL issues
-        serverSelectionTimeoutMS=30000  # 30 second timeout
-    )
-    
-    # Test connection
+    client = MongoClient(MONGO_URI, tlsCAFile=certifi.where(), serverSelectionTimeoutMS=30000)
     client.admin.command('ping')
-    print("✅ Successfully connected to MongoDB!")
-    
-    # Initialize database and collections
     db = client['comment_bot']
+    users = db['users']
+    channels = db['channels']
+    buttons = db['buttons']
+    comments = db['comments']
+    settings = db['settings']
+    pending = db['pending_approvals']
     
-    users_collection = db['users']
-    channels_collection = db['channels']
-    buttons_collection = db['buttons']
-    comments_collection = db['comments']
-    settings_collection = db['settings']
-    pending_approvals_collection = db['pending_approvals']
-    
-    # Initialize default settings if not exists
-    if settings_collection.count_documents({}) == 0:
-        settings_collection.insert_one({
-            'bot_status': True,
-            'over_message': 'No more comments available for this app.',
-            'buttons': []
-        })
-        print("✅ Default settings created!")
-    else:
-        print("✅ Settings already exist in database")
-        
+    # Default settings
+    if not settings.find_one():
+        settings.insert_one({'bot_status': True, 'over_message': 'No more comments available.'})
+    print("✅ MongoDB connected")
 except Exception as e:
-    print(f"❌ MongoDB connection failed: {e}")
-    print("Please check your connection string and network settings")
-    # Create dummy collections to prevent crashes (will be replaced when connection works)
-    class DummyCollection:
-        def find(self, *args, **kwargs): return []
-        def find_one(self, *args, **kwargs): return None
-        def insert_one(self, *args, **kwargs): return None
-        def update_one(self, *args, **kwargs): return None
-        def delete_one(self, *args, **kwargs): return None
-        def count_documents(self, *args, **kwargs): return 0
-    
-    users_collection = DummyCollection()
-    channels_collection = DummyCollection()
-    buttons_collection = DummyCollection()
-    comments_collection = DummyCollection()
-    settings_collection = DummyCollection()
-    pending_approvals_collection = DummyCollection()
+    print(f"❌ MongoDB failed: {e}")
+    # Dummy collections to prevent crashes
+    class Dummy:
+        def find_one(self, *a, **k): return None
+        def find(self, *a, **k): return []
+        def insert_one(self, *a, **k): return None
+        def update_one(self, *a, **k): return None
+        def delete_one(self, *a, **k): return None
+        def count_documents(self, *a, **k): return 0
+    users = channels = buttons = comments = settings = pending = Dummy()
 
-class CommentBot:
+class Bot:
     def __init__(self):
-        # Safely get settings with error handling
         self.load_settings()
     
     def load_settings(self):
-        """Load settings safely with error handling"""
-        try:
-            settings = settings_collection.find_one()
-            if settings:
-                self.bot_status = settings.get('bot_status', True)
-                self.over_message = settings.get('over_message', 'No more comments available for this app.')
-                print(f"✅ Settings loaded: bot_status={self.bot_status}")
-            else:
-                print("⚠️ No settings found, creating default...")
-                # Create default settings if not exists
-                settings_collection.insert_one({
-                    'bot_status': True,
-                    'over_message': 'No more comments available for this app.',
-                    'buttons': []
-                })
-                self.bot_status = True
-                self.over_message = 'No more comments available for this app.'
-                print("✅ Created default settings in __init__")
-        except Exception as e:
-            print(f"⚠️ Error loading settings: {e}")
-            traceback.print_exc()
-            self.bot_status = True
-            self.over_message = 'No more comments available for this app.'
+        s = settings.find_one()
+        self.bot_on = s.get('bot_status', True) if s else True
+        self.over_msg = s.get('over_message', 'No more comments available.') if s else 'No more comments available.'
 
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ================== START & MAIN MENU ==================
+    async def start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
-        user_id = user.id
+        if user.id in ADMIN_IDS:
+            return await self.admin_panel(update, ctx)
         
-        print(f"👤 User {user_id} (@{user.username}) started the bot")
+        if not self.bot_on:
+            return await update.message.reply_text("No Apps Available For Comment")
         
-        # Reload settings to ensure latest status
-        self.load_settings()
+        u = users.find_one({'user_id': user.id})
+        if u and u.get('approved'):
+            return await self.user_menu(update, ctx)
+        elif u and u.get('rejected'):
+            return await update.message.reply_text("Sorry, your approval was rejected. Contact @DTXZAHID")
+        elif u and u.get('pending'):
+            return await update.message.reply_text("Your approval is pending. Please wait.")
         
-        # Check if bot is on
-        if not self.bot_status:
-            await update.message.reply_text("No Apps Available For Comment")
-            return
+        # New user: check channels
+        ch_list = list(channels.find())
+        if not ch_list:
+            return await self.ask_approval(update, ctx)
         
-        # Check if user is admin - if admin, show admin panel directly
-        if user_id in ADMIN_IDS:
-            print(f"👑 Admin {user_id} accessed bot - showing admin panel")
-            await self.show_admin_panel_direct(update, context)
-            return
-        
-        # For non-admin users, check approval status
-        try:
-            user_data = users_collection.find_one({'user_id': user_id})
-        except Exception as e:
-            print(f"❌ Error checking user data: {e}")
-            user_data = None
-        
-        if user_data and user_data.get('approved', False):
-            print(f"✅ Approved user {user_id} - showing app buttons")
-            # Show main menu with app buttons
-            await self.show_main_menu(update, context)
-        elif user_data and user_data.get('rejected', False):
-            print(f"❌ Rejected user {user_id} tried to access")
-            await update.message.reply_text(
-                "Sorry But Your Approval Has Been Rejected By Owner. "
-                "If You Have Any Issue Contact To @DTXZAHID"
-            )
-        elif user_data and user_data.get('pending', False):
-            print(f"⏳ Pending user {user_id} tried to access")
-            await update.message.reply_text(
-                "Your approval request is already pending. Please wait for admin response."
-            )
-        else:
-            print(f"🆕 New user {user_id} - showing approval flow")
-            # Check force join channels first
-            await self.check_force_join_before_approval(update, context)
-
-    async def admin_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /admin command - ONLY for admins"""
-        user_id = update.effective_user.id
-        
-        print(f"👑 User {user_id} used /admin command")
-        
-        if user_id in ADMIN_IDS:
-            # Show FULL admin panel to admins
-            await self.show_admin_panel_direct(update, context)
-        else:
-            print(f"⛔ Non-admin {user_id} tried to use /admin")
-            await update.message.reply_text("⛔ Unauthorized! This command is for admins only.")
-
-    async def show_admin_panel_direct(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show FULL admin panel directly to admins"""
-        try:
-            print("🔄 Loading FULL admin panel for admin...")
-            
-            # Reload settings to ensure latest
-            self.load_settings()
-            
-            # Try to get settings from database
-            try:
-                settings = settings_collection.find_one()
-                if not settings:
-                    print("⚠️ No settings found in database, creating...")
-                    # Create settings if still not exists
-                    settings_collection.insert_one({
-                        'bot_status': True,
-                        'over_message': 'No more comments available for this app.',
-                        'buttons': []
-                    })
-                    settings = settings_collection.find_one()
-                    print("✅ Settings created successfully")
-            except Exception as e:
-                print(f"❌ Error accessing settings: {e}")
-                traceback.print_exc()
-                settings = {'bot_status': True, 'over_message': 'Default message'}
-            
-            bot_status = settings.get('bot_status', True)
-            status_text = "ON ✅" if bot_status else "OFF ❌"
-            
-            print(f"📊 Admin panel loaded with status: {status_text}")
-            
-            # FULL admin panel with all features
-            keyboard = [
-                [InlineKeyboardButton("📢 Manage Channels", callback_data="manage_channels")],
-                [InlineKeyboardButton("🔘 Manage Buttons", callback_data="manage_buttons")],
-                [InlineKeyboardButton("➕ Add Comments", callback_data="show_buttons_for_comments")],
-                [InlineKeyboardButton("📊 View Stats", callback_data="view_stats")],
-                [InlineKeyboardButton("✏️ Set Over Message", callback_data="set_over_message")],
-                [InlineKeyboardButton("🔙 Main Menu", callback_data="back_to_main")]
-            ]
-            
-            # Add bot status button at the top
-            if bot_status:
-                keyboard.insert(0, [InlineKeyboardButton("🤖 Turn Bot OFF", callback_data="bot_off")])
-            else:
-                keyboard.insert(0, [InlineKeyboardButton("🤖 Turn Bot ON", callback_data="bot_on")])
-            
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            await update.message.reply_text(
-                "⚙️ Admin Panel\n\n"
-                f"Bot Status: {status_text}\n"
-                "Select an option:",
-                reply_markup=reply_markup
-            )
-            print("✅ FULL admin panel displayed successfully")
-            
-        except Exception as e:
-            print(f"❌ Error in admin panel: {e}")
-            traceback.print_exc()
-            # If database fails, show limited panel with error message
-            keyboard = [
-                [InlineKeyboardButton("📢 Manage Channels", callback_data="manage_channels")],
-                [InlineKeyboardButton("🔘 Manage Buttons", callback_data="manage_buttons")],
-                [InlineKeyboardButton("🔙 Main Menu", callback_data="back_to_main")]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            await update.message.reply_text(
-                "⚠️ Admin Panel (Limited Mode)\n\n"
-                "Database connection issue detected.\n"
-                "Some features may be unavailable.\n"
-                "Please check MongoDB connection.",
-                reply_markup=reply_markup
-            )
-
-    async def show_main_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show main menu with app buttons for approved users"""
-        try:
-            buttons = list(buttons_collection.find())
-        except Exception as e:
-            print(f"❌ Error getting buttons: {e}")
-            buttons = []
-        
-        if not buttons:
-            message = update.message if update.message else update.callback_query.message
-            await message.reply_text(
-                "No apps available at the moment. Please check back later."
-            )
-            return
-        
-        keyboard = []
-        for button in buttons:
-            keyboard.append([InlineKeyboardButton(
-                button['button_name'], 
-                callback_data=f"button_{button['button_id']}"
-            )])
-        
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        message = update.message if update.message else update.callback_query.message
-        await message.reply_text(
-            "Welcome To Comment Provider Bot By Zahid\n\nPlease select an app:",
-            reply_markup=reply_markup
-        )
-
-    async def check_force_join_before_approval(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Check force join channels before showing approval option"""
-        try:
-            channels = list(channels_collection.find())
-        except Exception as e:
-            print(f"❌ Error getting channels: {e}")
-            channels = []
-        
-        if not channels:
-            # No channels to join, show approval option
-            await self.show_approval_option(update, context)
-            return
-        
-        user_id = update.effective_user.id
         not_joined = []
-        
-        for channel in channels:
+        for ch in ch_list:
             try:
-                member = await context.bot.get_chat_member(chat_id=channel['channel_id'], user_id=user_id)
+                member = await ctx.bot.get_chat_member(chat_id=ch['channel_id'], user_id=user.id)
                 if member.status not in ['member', 'administrator', 'creator']:
-                    not_joined.append(channel)
-            except Exception as e:
-                print(f"⚠️ Error checking channel {channel.get('channel_name')}: {e}")
-                not_joined.append(channel)
+                    not_joined.append(ch)
+            except:
+                not_joined.append(ch)
         
         if not_joined:
-            # Create buttons for channels
-            keyboard = []
-            for channel in not_joined:
-                keyboard.append([InlineKeyboardButton(
-                    f"Join {channel['channel_name']}", 
-                    url=channel['channel_link']
-                )])
-            
-            keyboard.append([InlineKeyboardButton("✅ I've Joined", callback_data="check_join_before_approval")])
-            
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await update.message.reply_text(
-                "Please join these channels to use the bot:",
-                reply_markup=reply_markup
-            )
+            keyboard = [[InlineKeyboardButton(f"Join {ch['channel_name']}", url=ch['channel_link'])] for ch in not_joined]
+            keyboard.append([InlineKeyboardButton("✅ I've Joined", callback_data="check_join")])
+            await update.message.reply_text("Please join these channels:", reply_markup=InlineKeyboardMarkup(keyboard))
         else:
-            await self.show_approval_option(update, context)
+            await self.ask_approval(update, ctx)
 
-    async def show_approval_option(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show approval request option to user"""
-        user = update.effective_user
-        
-        # Check if already pending
-        try:
-            existing = pending_approvals_collection.find_one({'user_id': user.id})
-        except Exception as e:
-            print(f"❌ Error checking pending approvals: {e}")
-            existing = None
-        
-        if existing:
-            await update.message.reply_text(
-                "Your approval request is already pending. Please wait for admin response."
-            )
-            return
-        
-        # Check if already approved
-        try:
-            user_data = users_collection.find_one({'user_id': user.id})
-        except Exception as e:
-            print(f"❌ Error checking user data: {e}")
-            user_data = None
-            
-        if user_data and user_data.get('approved', False):
-            await self.show_main_menu(update, context)
-            return
-        
-        # Check if rejected
-        if user_data and user_data.get('rejected', False):
-            await update.message.reply_text(
-                "Sorry But Your Approval Has Been Rejected By Owner. "
-                "If You Have Any Issue Contact To @DTXZAHID"
-            )
-            return
-        
-        # Show approval option with buttons
+    async def user_menu(self, update, ctx):
+        btns = list(buttons.find())
+        if not btns:
+            return await update.message.reply_text("No apps available.")
+        keyboard = [[InlineKeyboardButton(b['button_name'], callback_data=f"btn_{b['button_id']}")] for b in btns]
+        await update.message.reply_text("Select an app:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    async def ask_approval(self, update, ctx):
         keyboard = [
-            [InlineKeyboardButton("✅ Request Approval", callback_data="request_approval")],
-            [InlineKeyboardButton("❌ Cancel", callback_data="cancel_approval")]
+            [InlineKeyboardButton("✅ Request Approval", callback_data="req_approval")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
         ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(
-            "To use this bot, you need approval from admin.\n\n"
-            "Do you want to send an approval request?",
-            reply_markup=reply_markup
-        )
+        await update.message.reply_text("You need admin approval. Send request?", reply_markup=InlineKeyboardMarkup(keyboard))
 
-    async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
-        
-        data = query.data
-        user_id = query.from_user.id
-        
-        print(f"🔄 Callback from user {user_id}: {data}")
-        
-        # Handle approval related callbacks
-        if data == "request_approval":
-            await self.request_approval_handler(query, context)
-        elif data == "cancel_approval":
-            await query.message.edit_text("Approval request cancelled. Send /start if you change your mind.")
-        elif data == "check_join_before_approval":
-            await self.check_join_before_approval(query, context)
-        elif data.startswith("approve_") or data.startswith("reject_"):
-            await self.handle_approval(query, context)
-        
-        # Admin panel callbacks - only for admins
-        elif data == "admin_panel":
-            if user_id in ADMIN_IDS:
-                await self.show_admin_panel(query, context)
-            else:
-                await query.message.reply_text("⛔ Unauthorized!")
-        
-        # Main menu callbacks for approved users
-        elif data.startswith("button_"):
-            button_id = data.replace("button_", "")
-            await self.show_comment_confirmation(query, context, button_id)
-        elif data.startswith("agree_"):
-            button_id = data.replace("agree_", "")
-            await self.provide_comment(query, context, button_id)
-        elif data == "no_thanks":
-            await self.show_main_menu_from_callback(query, context)
-        
-        # Admin management callbacks - only for admins
-        elif data.startswith("add_comments_"):
-            if user_id in ADMIN_IDS:
-                button_id = data.replace("add_comments_", "")
-                context.user_data['current_button'] = button_id
-                await query.message.reply_text(
-                    "Please send comments in this format:\n"
-                    "Comment 1, Comment 2, Comment 3, ...\n\n"
-                    "You can send as many comments as you want separated by commas."
-                )
-            else:
-                await query.message.reply_text("⛔ Unauthorized!")
-        elif data.startswith("stats_"):
-            if user_id in ADMIN_IDS:
-                button_id = data.replace("stats_", "")
-                await self.show_button_stats(query, context, button_id)
-            else:
-                await query.message.reply_text("⛔ Unauthorized!")
-        elif data == "add_channel":
-            if user_id in ADMIN_IDS:
-                await query.message.reply_text("Please send the channel username or ID:")
-                context.user_data['waiting_for_channel'] = True
-            else:
-                await query.message.reply_text("⛔ Unauthorized!")
-        elif data == "remove_channel":
-            if user_id in ADMIN_IDS:
-                await self.show_channels_to_remove(query, context)
-            else:
-                await query.message.reply_text("⛔ Unauthorized!")
-        elif data == "add_button":
-            if user_id in ADMIN_IDS:
-                await query.message.reply_text("Please send the name for the new button:")
-                context.user_data['waiting_for_button_name'] = True
-            else:
-                await query.message.reply_text("⛔ Unauthorized!")
-        elif data == "remove_button":
-            if user_id in ADMIN_IDS:
-                await self.show_buttons_to_remove(query, context)
-            else:
-                await query.message.reply_text("⛔ Unauthorized!")
-        elif data == "bot_on":
-            if user_id in ADMIN_IDS:
-                try:
-                    settings_collection.update_one({}, {'$set': {'bot_status': True}})
-                    self.bot_status = True
-                    await query.message.edit_text("Bot turned ON successfully!")
-                except Exception as e:
-                    print(f"❌ Error turning bot on: {e}")
-                    await query.message.edit_text("❌ Error turning bot on. Check database.")
-                await self.show_admin_panel(query, context)
-            else:
-                await query.message.reply_text("⛔ Unauthorized!")
-        elif data == "bot_off":
-            if user_id in ADMIN_IDS:
-                try:
-                    settings_collection.update_one({}, {'$set': {'bot_status': False}})
-                    self.bot_status = False
-                    await query.message.edit_text("Bot turned OFF successfully!")
-                except Exception as e:
-                    print(f"❌ Error turning bot off: {e}")
-                    await query.message.edit_text("❌ Error turning bot off. Check database.")
-                await self.show_admin_panel(query, context)
-            else:
-                await query.message.reply_text("⛔ Unauthorized!")
-        elif data == "set_over_message":
-            if user_id in ADMIN_IDS:
-                await query.message.reply_text("Please send the new over message:")
-                context.user_data['waiting_for_over_message'] = True
-            else:
-                await query.message.reply_text("⛔ Unauthorized!")
-        elif data == "manage_channels":
-            if user_id in ADMIN_IDS:
-                await self.show_manage_channels(query, context)
-            else:
-                await query.message.reply_text("⛔ Unauthorized!")
-        elif data == "manage_buttons":
-            if user_id in ADMIN_IDS:
-                await self.show_manage_buttons(query, context)
-            else:
-                await query.message.reply_text("⛔ Unauthorized!")
-        elif data == "show_buttons_for_comments":
-            if user_id in ADMIN_IDS:
-                await self.show_buttons_for_comments(query, context)
-            else:
-                await query.message.reply_text("⛔ Unauthorized!")
-        elif data == "view_stats":
-            if user_id in ADMIN_IDS:
-                await self.show_view_stats(query, context)
-            else:
-                await query.message.reply_text("⛔ Unauthorized!")
-        elif data == "back_to_main":
-            await self.show_main_menu_from_callback(query, context)
-        elif data.startswith("remove_channel_"):
-            if user_id in ADMIN_IDS:
-                channel_id = data.replace("remove_channel_", "")
-                try:
-                    channels_collection.delete_one({'channel_id': channel_id})
-                    await query.message.edit_text("✅ Channel removed successfully!")
-                except Exception as e:
-                    print(f"❌ Error removing channel: {e}")
-                    await query.message.edit_text("❌ Error removing channel.")
-                await self.show_manage_channels(query, context)
-            else:
-                await query.message.reply_text("⛔ Unauthorized!")
-        elif data.startswith("remove_button_"):
-            if user_id in ADMIN_IDS:
-                button_id = data.replace("remove_button_", "")
-                try:
-                    buttons_collection.delete_one({'button_id': button_id})
-                    # Also remove related comments
-                    comments_collection.delete_many({'button_id': button_id})
-                    await query.message.edit_text("✅ Button removed successfully!")
-                except Exception as e:
-                    print(f"❌ Error removing button: {e}")
-                    await query.message.edit_text("❌ Error removing button.")
-                await self.show_manage_buttons(query, context)
-            else:
-                await query.message.reply_text("⛔ Unauthorized!")
-
-    async def show_admin_panel(self, query, context):
-        """Show FULL admin panel from callback - ONLY for admins"""
-        if query.from_user.id not in ADMIN_IDS:
-            await query.message.reply_text("⛔ Unauthorized!")
-            return
-        
-        try:
-            print("🔄 Loading FULL admin panel from callback...")
-            
-            # Reload settings to ensure latest
-            self.load_settings()
-            
-            # Try to get settings from database
-            try:
-                settings = settings_collection.find_one()
-                if not settings:
-                    print("⚠️ No settings found in database, creating...")
-                    settings_collection.insert_one({
-                        'bot_status': True,
-                        'over_message': 'No more comments available for this app.',
-                        'buttons': []
-                    })
-                    settings = settings_collection.find_one()
-                    print("✅ Settings created successfully")
-            except Exception as e:
-                print(f"❌ Error accessing settings: {e}")
-                traceback.print_exc()
-                settings = {'bot_status': True, 'over_message': 'Default message'}
-            
-            bot_status = settings.get('bot_status', True)
-            status_text = "ON ✅" if bot_status else "OFF ❌"
-            
-            print(f"📊 Admin panel loaded with status: {status_text}")
-            
-            # FULL admin panel with all features
-            keyboard = [
-                [InlineKeyboardButton("📢 Manage Channels", callback_data="manage_channels")],
-                [InlineKeyboardButton("🔘 Manage Buttons", callback_data="manage_buttons")],
-                [InlineKeyboardButton("➕ Add Comments", callback_data="show_buttons_for_comments")],
-                [InlineKeyboardButton("📊 View Stats", callback_data="view_stats")],
-                [InlineKeyboardButton("✏️ Set Over Message", callback_data="set_over_message")],
-                [InlineKeyboardButton("🔙 Main Menu", callback_data="back_to_main")]
-            ]
-            
-            # Add bot status button at the top
-            if bot_status:
-                keyboard.insert(0, [InlineKeyboardButton("🤖 Turn Bot OFF", callback_data="bot_off")])
-            else:
-                keyboard.insert(0, [InlineKeyboardButton("🤖 Turn Bot ON", callback_data="bot_on")])
-            
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            await query.message.edit_text(
-                "⚙️ Admin Panel\n\n"
-                f"Bot Status: {status_text}\n"
-                "Select an option:",
-                reply_markup=reply_markup
-            )
-            print("✅ FULL admin panel displayed successfully from callback")
-            
-        except Exception as e:
-            print(f"❌ Error in admin panel callback: {e}")
-            traceback.print_exc()
-            # Fallback limited panel
-            keyboard = [
-                [InlineKeyboardButton("📢 Manage Channels", callback_data="manage_channels")],
-                [InlineKeyboardButton("🔘 Manage Buttons", callback_data="manage_buttons")],
-                [InlineKeyboardButton("🔙 Main Menu", callback_data="back_to_main")]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            await query.message.edit_text(
-                "⚠️ Admin Panel (Limited Mode)\n\n"
-                "Database connection issue detected.\n"
-                "Some features may be unavailable.\n"
-                "Please check MongoDB connection.",
-                reply_markup=reply_markup
-            )
-
-    async def show_main_menu_from_callback(self, query, context):
-        """Show main menu from callback for approved users"""
-        try:
-            buttons = list(buttons_collection.find())
-        except Exception as e:
-            print(f"❌ Error getting buttons: {e}")
-            buttons = []
-        
-        if not buttons:
-            await query.message.edit_text(
-                "No apps available at the moment. Please check back later."
-            )
-            return
-        
-        keyboard = []
-        for button in buttons:
-            keyboard.append([InlineKeyboardButton(
-                button.get('button_name', 'Unknown'), 
-                callback_data=f"button_{button.get('button_id', '')}"
-            )])
-        
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.message.edit_text(
-            "Welcome To Comment Provider Bot By Zahid\n\nPlease select an app:",
-            reply_markup=reply_markup
-        )
-
-    async def request_approval_handler(self, query, context):
-        """Handle approval request from user"""
+    # ================== APPROVAL HANDLING ==================
+    async def request_approval(self, query, ctx):
         user = query.from_user
+        if pending.find_one({'user_id': user.id}):
+            return await query.message.edit_text("Request already pending.")
+        if users.find_one({'user_id': user.id, 'approved': True}):
+            return await query.message.edit_text("You're already approved! Send /start")
         
-        print(f"📨 User {user.id} requested approval")
-        
-        # Check if already pending
-        try:
-            existing = pending_approvals_collection.find_one({'user_id': user.id})
-        except Exception as e:
-            print(f"❌ Error checking pending: {e}")
-            existing = None
-            
-        if existing:
-            await query.message.edit_text(
-                "Your approval request is already pending. Please wait for admin response."
-            )
-            return
-        
-        # Check if already approved
-        try:
-            user_data = users_collection.find_one({'user_id': user.id})
-        except Exception as e:
-            print(f"❌ Error checking user: {e}")
-            user_data = None
-            
-        if user_data and user_data.get('approved', False):
-            await query.message.edit_text("You are already approved! Send /start to use the bot.")
-            return
-        
-        # Save pending approval
-        try:
-            pending_approvals_collection.insert_one({
-                'user_id': user.id,
-                'username': user.username,
-                'first_name': user.first_name,
-                'last_name': user.last_name,
-                'date': datetime.now(),
-                'status': 'pending'
-            })
-            
-            # Update user status
-            users_collection.update_one(
-                {'user_id': user.id},
-                {'$set': {'pending': True}},
-                upsert=True
-            )
-            print(f"✅ Saved pending approval for user {user.id}")
-        except Exception as e:
-            print(f"❌ Error saving pending approval: {e}")
-            await query.message.edit_text("❌ Error sending request. Please try again later.")
-            return
+        # Save pending
+        pending.insert_one({'user_id': user.id, 'username': user.username, 'first_name': user.first_name, 'date': datetime.now()})
+        users.update_one({'user_id': user.id}, {'$set': {'pending': True}}, upsert=True)
         
         # Notify admins
-        admin_notified = False
-        for admin_id in ADMIN_IDS:
+        for aid in ADMIN_IDS:
             try:
-                keyboard = [
-                    [InlineKeyboardButton("✅ Approve", callback_data=f"approve_{user.id}"),
-                     InlineKeyboardButton("❌ Reject", callback_data=f"reject_{user.id}")]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                
-                await context.bot.send_message(
-                    chat_id=admin_id,
-                    text=f"🔔 New Approval Request:\n\n"
-                         f"User ID: {user.id}\n"
-                         f"Username: @{user.username if user.username else 'None'}\n"
-                         f"Name: {user.first_name} {user.last_name or ''}\n"
-                         f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-                    reply_markup=reply_markup
-                )
-                admin_notified = True
-                print(f"✅ Notified admin {admin_id}")
-            except Exception as e:
-                print(f"❌ Failed to notify admin {admin_id}: {e}")
-        
-        if admin_notified:
-            await query.message.edit_text(
-                "✅ Your approval request has been sent to admin!\n\n"
-                "Please wait for response. You'll be notified once approved."
-            )
-        else:
-            await query.message.edit_text(
-                "⚠️ Your request was saved but couldn't notify admins.\n"
-                "Please contact @DTXZAHID directly."
-            )
-
-    async def handle_approval(self, query, context):
-        """Handle admin approval/rejection"""
-        if query.from_user.id not in ADMIN_IDS:
-            await query.answer("You are not authorized!")
-            return
-        
-        data = query.data
-        user_id = int(data.split('_')[1])
-        
-        print(f"👑 Admin {query.from_user.id} is handling user {user_id}: {data}")
-        
-        if data.startswith("approve"):
-            # Approve user
-            try:
-                users_collection.update_one(
-                    {'user_id': user_id},
-                    {'$set': {
-                        'approved': True, 
-                        'rejected': False,
-                        'pending': False
-                    }},
-                    upsert=True
-                )
-                pending_approvals_collection.delete_one({'user_id': user_id})
-                print(f"✅ User {user_id} approved in database")
-            except Exception as e:
-                print(f"❌ Error approving user in DB: {e}")
-            
-            # Notify user
-            try:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text="✅ Welcome To Comment Provider Bot By Zahid!\n\n"
-                         "Your approval request has been accepted!\n"
-                         "Send /start to begin using the bot."
-                )
-                print(f"✅ Notified user {user_id} of approval")
-            except Exception as e:
-                print(f"❌ Failed to notify user {user_id}: {e}")
-            
-            await query.message.edit_text(
-                query.message.text + "\n\n✅ User approved successfully!"
-            )
-        else:
-            # Reject user
-            try:
-                users_collection.update_one(
-                    {'user_id': user_id},
-                    {'$set': {
-                        'approved': False, 
-                        'rejected': True,
-                        'pending': False
-                    }},
-                    upsert=True
-                )
-                pending_approvals_collection.delete_one({'user_id': user_id})
-                print(f"✅ User {user_id} rejected in database")
-            except Exception as e:
-                print(f"❌ Error rejecting user in DB: {e}")
-            
-            # Notify user
-            try:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text="❌ Sorry But Your Approval Has Been Rejected By Owner.\n\n"
-                         "If You Have Any Issue Contact To @DTXZAHID"
-                )
-                print(f"✅ Notified user {user_id} of rejection")
-            except Exception as e:
-                print(f"❌ Failed to notify user {user_id}: {e}")
-            
-            await query.message.edit_text(
-                query.message.text + "\n\n❌ User rejected!"
-            )
-
-    async def check_join_before_approval(self, query, context):
-        """Check if user has joined all channels before showing approval option"""
-        try:
-            channels = list(channels_collection.find())
-        except Exception as e:
-            print(f"❌ Error getting channels: {e}")
-            channels = []
-            
-        user_id = query.from_user.id
-        not_joined = []
-        
-        for channel in channels:
-            try:
-                member = await context.bot.get_chat_member(chat_id=channel['channel_id'], user_id=user_id)
-                if member.status not in ['member', 'administrator', 'creator']:
-                    not_joined.append(channel)
-            except Exception as e:
-                print(f"⚠️ Error checking channel: {e}")
-                not_joined.append(channel)
-        
-        if not_joined:
-            keyboard = []
-            for channel in not_joined:
-                keyboard.append([InlineKeyboardButton(
-                    f"Join {channel['channel_name']}", 
-                    url=channel['channel_link']
-                )])
-            
-            keyboard.append([InlineKeyboardButton("✅ I've Joined", callback_data="check_join_before_approval")])
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await query.message.edit_text(
-                "You haven't joined all channels yet. Please join:",
-                reply_markup=reply_markup
-            )
-        else:
-            # Show approval option
-            keyboard = [
-                [InlineKeyboardButton("✅ Request Approval", callback_data="request_approval")],
-                [InlineKeyboardButton("❌ Cancel", callback_data="cancel_approval")]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            await query.message.edit_text(
-                "✅ You've joined all channels!\n\n"
-                "Do you want to send an approval request?",
-                reply_markup=reply_markup
-            )
-
-    async def show_comment_confirmation(self, query, context, button_id):
-        keyboard = [
-            [InlineKeyboardButton("✅ I Agree For This", callback_data=f"agree_{button_id}")],
-            [InlineKeyboardButton("❌ No Sorry", callback_data="no_thanks")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.message.edit_text(
-            "Do You Really Want This App Comment?\n"
-            "Note:- If You Don't Do 2-3 Apps And Take Comment You Maybe Banned",
-            reply_markup=reply_markup
-        )
-
-    async def provide_comment(self, query, context, button_id):
-        # Get next available comment - ATOMIC operation prevents duplicates
-        try:
-            comment = comments_collection.find_one_and_delete(
-                {'button_id': button_id, 'used': False},
-                sort=[('_id', 1)]
-            )
-        except Exception as e:
-            print(f"❌ Error getting comment: {e}")
-            await query.message.edit_text("❌ Error getting comment. Please try again.")
-            return
-        
-        if comment:
-            # Mark as used and track who got it
-            try:
-                comments_collection.update_one(
-                    {'_id': comment['_id']},
-                    {'$set': {
-                        'used': True, 
-                        'used_by': query.from_user.id, 
-                        'used_date': datetime.now()
-                    }}
-                )
-            except Exception as e:
-                print(f"❌ Error marking comment as used: {e}")
-            
-            message_text = f"Here Is Your Comment Go And Do Review\n\n<code>{comment['comment']}</code>"
-            
-            await query.message.edit_text(
-                message_text,
-                parse_mode='HTML'
-            )
-        else:
-            # No comments available
-            self.load_settings()  # Reload to get latest over_message
-            await query.message.edit_text(self.over_message)
-
-    async def show_manage_channels(self, query, context):
-        keyboard = [
-            [InlineKeyboardButton("➕ Add Channel", callback_data="add_channel")],
-            [InlineKeyboardButton("❌ Remove Channel", callback_data="remove_channel")],
-            [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        try:
-            channels = list(channels_collection.find())
-        except Exception as e:
-            print(f"❌ Error getting channels: {e}")
-            channels = []
-        
-        channel_list = "No channels added yet." if not channels else "\n".join([
-            f"• {c.get('channel_name', 'Unknown')} ({c.get('channel_id', 'No ID')})" for c in channels
-        ])
-        
-        await query.message.edit_text(
-            f"📢 Manage Channels\n\nCurrent Channels:\n{channel_list}\n\nSelect option:",
-            reply_markup=reply_markup
-        )
-
-    async def show_manage_buttons(self, query, context):
-        keyboard = [
-            [InlineKeyboardButton("➕ Add Button", callback_data="add_button")],
-            [InlineKeyboardButton("❌ Remove Button", callback_data="remove_button")],
-            [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        try:
-            buttons = list(buttons_collection.find())
-        except Exception as e:
-            print(f"❌ Error getting buttons: {e}")
-            buttons = []
-        
-        button_list = "No buttons added yet." if not buttons else "\n".join([
-            f"• {b.get('button_name', 'Unknown')}" for b in buttons
-        ])
-        
-        await query.message.edit_text(
-            f"🔘 Manage Buttons\n\nCurrent Buttons:\n{button_list}\n\nSelect option:",
-            reply_markup=reply_markup
-        )
-
-    async def show_buttons_for_comments(self, query, context):
-        try:
-            buttons = list(buttons_collection.find())
-        except Exception as e:
-            print(f"❌ Error getting buttons: {e}")
-            buttons = []
-        
-        if not buttons:
-            await query.message.edit_text(
-                "No buttons found. Please add buttons first.",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🔙 Back", callback_data="admin_panel")
-                ]])
-            )
-            return
-        
-        keyboard = []
-        for button in buttons:
-            keyboard.append([InlineKeyboardButton(
-                button.get('button_name', 'Unknown'), 
-                callback_data=f"add_comments_{button.get('button_id', '')}"
-            )])
-        
-        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="admin_panel")])
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.message.edit_text(
-            "Select button to add comments:",
-            reply_markup=reply_markup
-        )
-
-    async def show_button_stats(self, query, context, button_id):
-        try:
-            button = buttons_collection.find_one({'button_id': button_id})
-            if not button:
-                await query.message.edit_text("Button not found!")
-                return
-                
-            total_comments = comments_collection.count_documents({'button_id': button_id})
-            used_comments = comments_collection.count_documents({'button_id': button_id, 'used': True})
-            available_comments = total_comments - used_comments
-        except Exception as e:
-            print(f"❌ Error getting stats: {e}")
-            await query.message.edit_text("❌ Error getting stats. Check database.")
-            return
-        
-        stats_text = (
-            f"📊 Stats for: {button.get('button_name', 'Unknown')}\n\n"
-            f"Total Comments: {total_comments}\n"
-            f"Used Comments: {used_comments}\n"
-            f"Available: {available_comments}"
-        )
-        
-        await query.message.edit_text(
-            stats_text,
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔙 Back", callback_data="view_stats")
-            ]])
-        )
-
-    async def show_view_stats(self, query, context):
-        try:
-            buttons = list(buttons_collection.find())
-        except Exception as e:
-            print(f"❌ Error getting buttons: {e}")
-            buttons = []
-        
-        if not buttons:
-            await query.message.edit_text(
-                "No buttons found.",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🔙 Back", callback_data="admin_panel")
-                ]])
-            )
-            return
-        
-        keyboard = []
-        for button in buttons:
-            keyboard.append([InlineKeyboardButton(
-                button.get('button_name', 'Unknown'), 
-                callback_data=f"stats_{button.get('button_id', '')}"
-            )])
-        
-        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="admin_panel")])
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.message.edit_text(
-            "Select button to view stats:",
-            reply_markup=reply_markup
-        )
-
-    async def show_channels_to_remove(self, query, context):
-        try:
-            channels = list(channels_collection.find())
-        except Exception as e:
-            print(f"❌ Error getting channels: {e}")
-            channels = []
-        
-        if not channels:
-            await query.message.edit_text(
-                "No channels to remove.",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🔙 Back", callback_data="manage_channels")
-                ]])
-            )
-            return
-        
-        keyboard = []
-        for channel in channels:
-            keyboard.append([InlineKeyboardButton(
-                f"Remove {channel.get('channel_name', 'Unknown')}", 
-                callback_data=f"remove_channel_{channel.get('channel_id', '')}"
-            )])
-        
-        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="manage_channels")])
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.message.edit_text(
-            "Select channel to remove:",
-            reply_markup=reply_markup
-        )
-
-    async def show_buttons_to_remove(self, query, context):
-        try:
-            buttons = list(buttons_collection.find())
-        except Exception as e:
-            print(f"❌ Error getting buttons: {e}")
-            buttons = []
-        
-        if not buttons:
-            await query.message.edit_text(
-                "No buttons to remove.",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🔙 Back", callback_data="manage_buttons")
-                ]])
-            )
-            return
-        
-        keyboard = []
-        for button in buttons:
-            keyboard.append([InlineKeyboardButton(
-                f"Remove {button.get('button_name', 'Unknown')}", 
-                callback_data=f"remove_button_{button.get('button_id', '')}"
-            )])
-        
-        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="manage_buttons")])
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.message.edit_text(
-            "Select button to remove:",
-            reply_markup=reply_markup
-        )
-
-    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        is_admin = user_id in ADMIN_IDS
-        
-        print(f"📝 Message from user {user_id}: {update.message.text[:50]}...")
-        
-        # Only admins can use these admin features
-        if is_admin:
-            if 'current_button' in context.user_data:
-                # Adding comments
-                button_id = context.user_data['current_button']
-                text = update.message.text
-                
-                # Split comments by comma
-                comments = [c.strip() for c in text.split(',') if c.strip()]
-                
-                # Save comments
-                saved_count = 0
-                for comment in comments:
-                    try:
-                        comments_collection.insert_one({
-                            'button_id': button_id,
-                            'comment': comment,
-                            'used': False,
-                            'added_date': datetime.now()
-                        })
-                        saved_count += 1
-                    except Exception as e:
-                        print(f"❌ Error saving comment: {e}")
-                
-                del context.user_data['current_button']
-                
-                await update.message.reply_text(
-                    f"✅ Added {saved_count} comments successfully!\n\n"
-                    f"Comments: {', '.join(comments[:5])}{'...' if len(comments) > 5 else ''}"
-                )
-                
-                # Show admin panel again
-                await self.show_admin_panel_from_message(update, context)
-            
-            elif context.user_data.get('waiting_for_channel'):
-                # Adding channel
-                channel_input = update.message.text
-                context.user_data['channel_input'] = channel_input
-                await update.message.reply_text("Please send the channel invite link:")
-                context.user_data['waiting_for_channel_link'] = True
-                del context.user_data['waiting_for_channel']
-            
-            elif context.user_data.get('waiting_for_channel_link'):
-                # Save channel with link
-                channel_input = context.user_data.get('channel_input')
-                channel_link = update.message.text
-                
-                # Generate a unique ID
-                channel_id = str(datetime.timestamp()).replace('.', '')
-                
-                try:
-                    channels_collection.insert_one({
-                        'channel_id': channel_id,
-                        'channel_name': channel_input,
-                        'channel_link': channel_link
-                    })
-                    await update.message.reply_text("✅ Channel added successfully!")
-                except Exception as e:
-                    print(f"❌ Error saving channel: {e}")
-                    await update.message.reply_text("❌ Error saving channel. Check database.")
-                
-                del context.user_data['channel_input']
-                del context.user_data['waiting_for_channel_link']
-                
-                await self.show_admin_panel_from_message(update, context)
-            
-            elif context.user_data.get('waiting_for_button_name'):
-                # Adding button
-                button_name = update.message.text
-                
-                # Generate a unique ID
-                button_id = str(datetime.timestamp()).replace('.', '')
-                
-                try:
-                    buttons_collection.insert_one({
-                        'button_id': button_id,
-                        'button_name': button_name
-                    })
-                    await update.message.reply_text("✅ Button added successfully!")
-                except Exception as e:
-                    print(f"❌ Error saving button: {e}")
-                    await update.message.reply_text("❌ Error saving button. Check database.")
-                
-                del context.user_data['waiting_for_button_name']
-                
-                await self.show_admin_panel_from_message(update, context)
-            
-            elif context.user_data.get('waiting_for_over_message'):
-                # Set over message
-                over_message = update.message.text
-                
-                try:
-                    settings_collection.update_one(
-                        {},
-                        {'$set': {'over_message': over_message}},
-                        upsert=True
-                    )
-                    self.over_message = over_message
-                    await update.message.reply_text("✅ Over message updated successfully!")
-                except Exception as e:
-                    print(f"❌ Error saving over message: {e}")
-                    await update.message.reply_text("❌ Error saving over message. Check database.")
-                
-                del context.user_data['waiting_for_over_message']
-                
-                await self.show_admin_panel_from_message(update, context)
-            
-            else:
-                # Just start the bot for admin
-                await self.start(update, context)
-        else:
-            # Non-admin users just get the start flow
-            await self.start(update, context)
-
-    async def show_admin_panel_from_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show admin panel from message - ONLY for admins"""
-        if update.effective_user.id not in ADMIN_IDS:
-            return
-            
-        # Create a fake callback query
-        class FakeQuery:
-            def __init__(self, user, message):
-                self.from_user = user
-                self.message = message
-                self.data = "admin_panel"
-            
-            async def edit_text(self, text, reply_markup=None, parse_mode=None):
-                await self.message.reply_text(text, reply_markup=reply_markup)
-            
-            async def answer(self):
+                kb = [[InlineKeyboardButton("✅ Approve", callback_data=f"app_{user.id}"),
+                       InlineKeyboardButton("❌ Reject", callback_data=f"rej_{user.id}")]]
+                await ctx.bot.send_message(aid, f"New approval request from {user.first_name} (@{user.username})", reply_markup=InlineKeyboardMarkup(kb))
+            except:
                 pass
-        
-        fake_query = FakeQuery(update.effective_user, update.message)
-        await self.show_admin_panel(fake_query, context)
+        await query.message.edit_text("Request sent! You'll be notified once approved.")
+
+    async def handle_approval(self, query, ctx):
+        if query.from_user.id not in ADMIN_IDS:
+            return await query.answer("Unauthorized")
+        data = query.data
+        uid = int(data.split('_')[1])
+        if data.startswith('app'):
+            users.update_one({'user_id': uid}, {'$set': {'approved': True, 'pending': False, 'rejected': False}}, upsert=True)
+            pending.delete_one({'user_id': uid})
+            try:
+                await ctx.bot.send_message(uid, "✅ Welcome To Comment Provider Bot By Zahid! Send /start")
+            except:
+                pass
+            await query.message.edit_text(query.message.text + "\n✅ Approved")
+        else:
+            users.update_one({'user_id': uid}, {'$set': {'approved': False, 'pending': False, 'rejected': True}}, upsert=True)
+            pending.delete_one({'user_id': uid})
+            try:
+                await ctx.bot.send_message(uid, "❌ Your approval was rejected. Contact @DTXZAHID")
+            except:
+                pass
+            await query.message.edit_text(query.message.text + "\n❌ Rejected")
+
+    # ================== COMMENT SYSTEM ==================
+    async def show_comment_confirm(self, query, btn_id):
+        kb = [[InlineKeyboardButton("✅ I Agree", callback_data=f"agree_{btn_id}"),
+               InlineKeyboardButton("❌ No", callback_data="back_main")]]
+        await query.message.edit_text("Do you really want this app comment?\nNote: If you don't do 2-3 apps you may be banned.", reply_markup=InlineKeyboardMarkup(kb))
+
+    async def give_comment(self, query, btn_id):
+        # Atomic: find and mark used
+        com = comments.find_one_and_delete({'button_id': btn_id, 'used': False}, sort=[('_id', 1)])
+        if com:
+            comments.update_one({'_id': com['_id']}, {'$set': {'used': True, 'used_by': query.from_user.id, 'used_date': datetime.now()}})
+            await query.message.edit_text(f"Here is your comment:\n\n<code>{com['comment']}</code>", parse_mode='HTML')
+        else:
+            self.load_settings()
+            await query.message.edit_text(self.over_msg)
+
+    # ================== ADMIN PANEL ==================
+    async def admin_panel(self, update, ctx, edit=False):
+        s = settings.find_one() or {}
+        status = "ON ✅" if s.get('bot_status', True) else "OFF ❌"
+        kb = [
+            [InlineKeyboardButton("🤖 Turn OFF" if s.get('bot_status') else "🤖 Turn ON", callback_data="toggle")],
+            [InlineKeyboardButton("📢 Channels", callback_data="man_chan"), InlineKeyboardButton("🔘 Buttons", callback_data="man_btn")],
+            [InlineKeyboardButton("➕ Add Comments", callback_data="add_com"), InlineKeyboardButton("📊 Stats", callback_data="stats")],
+            [InlineKeyboardButton("✏️ Over Message", callback_data="set_msg"), InlineKeyboardButton("🔙 Main", callback_data="back_main")]
+        ]
+        text = f"⚙️ Admin Panel\nBot Status: {status}"
+        if edit:
+            await update.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb))
+        else:
+            await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
+
+    # ================== CONVERSATIONS ==================
+    async def add_channel_start(self, query, ctx):
+        await query.message.reply_text("Send the channel username or ID:")
+        return CHANNEL_NAME
+
+    async def add_channel_name(self, update, ctx):
+        ctx.user_data['chan_name'] = update.message.text
+        await update.message.reply_text("Now send the invite link:")
+        return CHANNEL_LINK
+
+    async def add_channel_link(self, update, ctx):
+        name = ctx.user_data.pop('chan_name')
+        link = update.message.text
+        chan_id = str(datetime.timestamp()).replace('.', '')
+        channels.insert_one({'channel_id': chan_id, 'channel_name': name, 'channel_link': link})
+        await update.message.reply_text("✅ Channel added!")
+        await self.admin_panel(update, ctx)
+        return ConversationHandler.END
+
+    async def add_button_start(self, query, ctx):
+        await query.message.reply_text("Send the button name:")
+        return BUTTON_NAME
+
+    async def add_button_name(self, update, ctx):
+        name = update.message.text
+        btn_id = str(datetime.timestamp()).replace('.', '')
+        buttons.insert_one({'button_id': btn_id, 'button_name': name})
+        await update.message.reply_text("✅ Button added!")
+        await self.admin_panel(update, ctx)
+        return ConversationHandler.END
+
+    async def add_comments_start(self, query, ctx):
+        btns = list(buttons.find())
+        if not btns:
+            await query.message.edit_text("No buttons yet.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin")]]))
+            return ConversationHandler.END
+        kb = [[InlineKeyboardButton(b['button_name'], callback_data=f"selbtn_{b['button_id']}")] for b in btns]
+        kb.append([InlineKeyboardButton("Back", callback_data="admin")])
+        await query.message.edit_text("Select button:", reply_markup=InlineKeyboardMarkup(kb))
+        return COMMENTS
+
+    async def select_button_for_comments(self, query, ctx):
+        btn_id = query.data.replace("selbtn_", "")
+        ctx.user_data['com_btn'] = btn_id
+        await query.message.edit_text("Send comments separated by commas:\nExample: Great!, Awesome!, Love it!")
+        return COMMENTS
+
+    async def save_comments(self, update, ctx):
+        btn_id = ctx.user_data.pop('com_btn')
+        text = update.message.text
+        coms = [c.strip() for c in text.split(',') if c.strip()]
+        for c in coms:
+            comments.insert_one({'button_id': btn_id, 'comment': c, 'used': False, 'added_date': datetime.now()})
+        await update.message.reply_text(f"✅ Added {len(coms)} comments!")
+        await self.admin_panel(update, ctx)
+        return ConversationHandler.END
+
+    async def set_over_msg_start(self, query, ctx):
+        await query.message.reply_text("Send the new 'out of comments' message:")
+        return OVER_MESSAGE
+
+    async def save_over_msg(self, update, ctx):
+        msg = update.message.text
+        settings.update_one({}, {'$set': {'over_message': msg}}, upsert=True)
+        self.over_msg = msg
+        await update.message.reply_text("✅ Over message updated!")
+        await self.admin_panel(update, ctx)
+        return ConversationHandler.END
+
+    # ================== BUTTON HANDLER ==================
+    async def callback_handler(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        await q.answer()
+        data = q.data
+
+        # Public callbacks
+        if data == "check_join":
+            return await self.start(q, ctx)  # Re-check
+        if data == "req_approval":
+            return await self.request_approval(q, ctx)
+        if data == "cancel":
+            return await q.message.edit_text("Cancelled.")
+        if data.startswith("btn_"):
+            return await self.show_comment_confirm(q, data[4:])
+        if data.startswith("agree_"):
+            return await self.give_comment(q, data[6:])
+        if data == "back_main":
+            return await self.user_menu(q, ctx)
+
+        # Admin only below
+        if q.from_user.id not in ADMIN_IDS:
+            return await q.message.reply_text("Unauthorized")
+
+        if data == "admin":
+            return await self.admin_panel(q, ctx, edit=True)
+        if data == "toggle":
+            s = settings.find_one() or {}
+            new = not s.get('bot_status', True)
+            settings.update_one({}, {'$set': {'bot_status': new}}, upsert=True)
+            self.bot_on = new
+            await q.message.edit_text(f"Bot turned {'ON' if new else 'OFF'}!")
+            return await self.admin_panel(q, ctx, edit=True)
+
+        if data.startswith("app_") or data.startswith("rej_"):
+            return await self.handle_approval(q, ctx)
+
+        # Manage channels
+        if data == "man_chan":
+            chans = list(channels.find())
+            txt = "Channels:\n" + ("\n".join([f"• {c['channel_name']}" for c in chans]) if chans else "None")
+            kb = [[InlineKeyboardButton("➕ Add", callback_data="add_chan")],
+                  [InlineKeyboardButton("❌ Remove", callback_data="rem_chan")],
+                  [InlineKeyboardButton("Back", callback_data="admin")]]
+            await q.message.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
+        if data == "add_chan":
+            return await self.add_channel_start(q, ctx)
+        if data == "rem_chan":
+            chans = list(channels.find())
+            if not chans:
+                await q.message.edit_text("No channels to remove.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="man_chan")]]))
+                return
+            kb = [[InlineKeyboardButton(f"Remove {c['channel_name']}", callback_data=f"delchan_{c['channel_id']}")] for c in chans]
+            kb.append([InlineKeyboardButton("Back", callback_data="man_chan")])
+            await q.message.edit_text("Select channel to remove:", reply_markup=InlineKeyboardMarkup(kb))
+        if data.startswith("delchan_"):
+            cid = data[8:]
+            channels.delete_one({'channel_id': cid})
+            await q.message.edit_text("Channel removed.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="man_chan")]]))
+
+        # Manage buttons
+        if data == "man_btn":
+            btns = list(buttons.find())
+            txt = "Buttons:\n" + ("\n".join([f"• {b['button_name']}" for b in btns]) if btns else "None")
+            kb = [[InlineKeyboardButton("➕ Add", callback_data="add_btn")],
+                  [InlineKeyboardButton("❌ Remove", callback_data="rem_btn")],
+                  [InlineKeyboardButton("Back", callback_data="admin")]]
+            await q.message.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
+        if data == "add_btn":
+            return await self.add_button_start(q, ctx)
+        if data == "rem_btn":
+            btns = list(buttons.find())
+            if not btns:
+                await q.message.edit_text("No buttons to remove.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="man_btn")]]))
+                return
+            kb = [[InlineKeyboardButton(f"Remove {b['button_name']}", callback_data=f"delbtn_{b['button_id']}")] for b in btns]
+            kb.append([InlineKeyboardButton("Back", callback_data="man_btn")])
+            await q.message.edit_text("Select button to remove:", reply_markup=InlineKeyboardMarkup(kb))
+        if data.startswith("delbtn_"):
+            bid = data[7:]
+            buttons.delete_one({'button_id': bid})
+            comments.delete_many({'button_id': bid})
+            await q.message.edit_text("Button removed.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="man_btn")]]))
+
+        # Add comments
+        if data == "add_com":
+            return await self.add_comments_start(q, ctx)
+        if data.startswith("selbtn_"):
+            return await self.select_button_for_comments(q, ctx)
+
+        # Stats
+        if data == "stats":
+            btns = list(buttons.find())
+            if not btns:
+                await q.message.edit_text("No buttons.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin")]]))
+                return
+            txt = "Select button for stats:"
+            kb = [[InlineKeyboardButton(b['button_name'], callback_data=f"stat_{b['button_id']}")] for b in btns]
+            kb.append([InlineKeyboardButton("Back", callback_data="admin")])
+            await q.message.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
+        if data.startswith("stat_"):
+            bid = data[5:]
+            total = comments.count_documents({'button_id': bid})
+            used = comments.count_documents({'button_id': bid, 'used': True})
+            btn = buttons.find_one({'button_id': bid})
+            name = btn['button_name'] if btn else "?"
+            await q.message.edit_text(f"📊 {name}\nTotal: {total}\nUsed: {used}\nLeft: {total-used}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="stats")]]))
+
+        # Set over message
+        if data == "set_msg":
+            return await self.set_over_msg_start(q, ctx)
+
+    # ================== CANCEL ==================
+    async def cancel(self, update, ctx):
+        await update.message.reply_text("Cancelled.")
+        return ConversationHandler.END
 
 def main():
-    """Start the bot."""
-    # Create application
-    application = Application.builder().token(BOT_TOKEN).build()
-    
-    bot = CommentBot()
-    
-    # Add handlers
-    application.add_handler(CommandHandler("start", bot.start))
-    application.add_handler(CommandHandler("admin", bot.admin_command))
-    application.add_handler(CallbackQueryHandler(bot.button_callback))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
-    
-    # Start bot
-    print("🤖 Bot is starting...")
-    print(f"✅ Admin IDs: {ADMIN_IDS}")
-    print(f"✅ Use /admin command to access admin panel")
-    print("✅ Bot is now running! Press Ctrl+C to stop.")
-    
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    app = Application.builder().token(BOT_TOKEN).build()
+    bot = Bot()
 
-if __name__ == '__main__':
+    # Conversation handlers
+    chan_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(bot.add_channel_start, pattern="^add_chan$")],
+        states={CHANNEL_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot.add_channel_name)],
+                CHANNEL_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot.add_channel_link)]},
+        fallbacks=[CommandHandler('cancel', bot.cancel)]
+    )
+    btn_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(bot.add_button_start, pattern="^add_btn$")],
+        states={BUTTON_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot.add_button_name)]},
+        fallbacks=[CommandHandler('cancel', bot.cancel)]
+    )
+    com_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(bot.add_comments_start, pattern="^add_com$")],
+        states={COMMENTS: [CallbackQueryHandler(bot.select_button_for_comments, pattern="^selbtn_"),
+                           MessageHandler(filters.TEXT & ~filters.COMMAND, bot.save_comments)]},
+        fallbacks=[CommandHandler('cancel', bot.cancel)]
+    )
+    msg_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(bot.set_over_msg_start, pattern="^set_msg$")],
+        states={OVER_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot.save_over_msg)]},
+        fallbacks=[CommandHandler('cancel', bot.cancel)]
+    )
+
+    app.add_handler(CommandHandler("start", bot.start))
+    app.add_handler(CommandHandler("admin", lambda u,c: bot.admin_panel(u,c) if u.effective_user.id in ADMIN_IDS else u.message.reply_text("⛔ Unauthorized")))
+    app.add_handler(CallbackQueryHandler(bot.callback_handler))
+    app.add_handler(chan_conv)
+    app.add_handler(btn_conv)
+    app.add_handler(com_conv)
+    app.add_handler(msg_conv)
+
+    print("🤖 Bot running...")
+    app.run_polling()
+
+if __name__ == "__main__":
     main()
