@@ -74,8 +74,9 @@ except Exception as e:
 
 class CommentBot:
     def __init__(self):
-        self.bot_status = settings_collection.find_one()['bot_status'] if settings_collection.find_one() else True
-        self.over_message = settings_collection.find_one()['over_message'] if settings_collection.find_one() else 'No more comments available for this app.'
+        settings = settings_collection.find_one()
+        self.bot_status = settings['bot_status'] if settings else True
+        self.over_message = settings['over_message'] if settings else 'No more comments available for this app.'
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
@@ -84,6 +85,11 @@ class CommentBot:
         # Check if bot is on
         if not self.bot_status:
             await update.message.reply_text("No Apps Available For Comment")
+            return
+        
+        # Check if user is admin
+        if user_id in ADMIN_IDS:
+            await self.show_admin_panel_direct(update, context)
             return
         
         # Check if user is approved
@@ -97,16 +103,60 @@ class CommentBot:
                 "Sorry But Your Approval Has Been Rejected By Owner. "
                 "If You Have Any Issue Contact To @DTXZAHID"
             )
+        elif user_data and user_data.get('pending', False):
+            await update.message.reply_text(
+                "Your approval request is already pending. Please wait for admin response."
+            )
         else:
-            # Check force join channels
-            await self.check_force_join(update, context)
+            # Check force join channels first
+            await self.check_force_join_before_approval(update, context)
 
-    async def check_force_join(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def admin_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /admin command"""
+        user_id = update.effective_user.id
+        
+        if user_id in ADMIN_IDS:
+            await self.show_admin_panel_direct(update, context)
+        else:
+            await update.message.reply_text("⛔ Unauthorized! This command is for admins only.")
+
+    async def show_admin_panel_direct(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show admin panel directly without requiring main menu"""
+        settings = settings_collection.find_one()
+        bot_status = settings['bot_status']
+        status_text = "ON ✅" if bot_status else "OFF ❌"
+        
+        keyboard = [
+            [InlineKeyboardButton("📢 Manage Channels", callback_data="manage_channels")],
+            [InlineKeyboardButton("🔘 Manage Buttons", callback_data="manage_buttons")],
+            [InlineKeyboardButton("➕ Add Comments", callback_data="show_buttons_for_comments")],
+            [InlineKeyboardButton("📊 View Stats", callback_data="view_stats")],
+            [InlineKeyboardButton("✏️ Set Over Message", callback_data="set_over_message")],
+            [InlineKeyboardButton("🔙 Main Menu", callback_data="back_to_main")]
+        ]
+        
+        # Add bot status button at the top
+        if bot_status:
+            keyboard.insert(0, [InlineKeyboardButton("🤖 Turn Bot OFF", callback_data="bot_off")])
+        else:
+            keyboard.insert(0, [InlineKeyboardButton("🤖 Turn Bot ON", callback_data="bot_on")])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            "⚙️ Admin Panel\n\n"
+            f"Bot Status: {status_text}\n"
+            "Select an option:",
+            reply_markup=reply_markup
+        )
+
+    async def check_force_join_before_approval(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Check force join channels before showing approval option"""
         channels = list(channels_collection.find())
         
         if not channels:
-            # No channels to join, proceed to approval
-            await self.request_approval(update, context)
+            # No channels to join, show approval option
+            await self.show_approval_option(update, context)
             return
         
         user_id = update.effective_user.id
@@ -129,7 +179,7 @@ class CommentBot:
                     url=channel['channel_link']
                 )])
             
-            keyboard.append([InlineKeyboardButton("✅ I've Joined", callback_data="check_join")])
+            keyboard.append([InlineKeyboardButton("✅ I've Joined", callback_data="check_join_before_approval")])
             
             reply_markup = InlineKeyboardMarkup(keyboard)
             await update.message.reply_text(
@@ -137,15 +187,63 @@ class CommentBot:
                 reply_markup=reply_markup
             )
         else:
-            await self.request_approval(update, context)
+            await self.show_approval_option(update, context)
 
-    async def request_approval(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def show_approval_option(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show approval request option to user"""
         user = update.effective_user
         
         # Check if already pending
         existing = pending_approvals_collection.find_one({'user_id': user.id})
         if existing:
-            await update.message.reply_text("Your approval request is already pending. Please wait for admin response.")
+            await update.message.reply_text(
+                "Your approval request is already pending. Please wait for admin response."
+            )
+            return
+        
+        # Check if already approved
+        user_data = users_collection.find_one({'user_id': user.id})
+        if user_data and user_data.get('approved', False):
+            await self.show_main_menu(update, context)
+            return
+        
+        # Check if rejected
+        if user_data and user_data.get('rejected', False):
+            await update.message.reply_text(
+                "Sorry But Your Approval Has Been Rejected By Owner. "
+                "If You Have Any Issue Contact To @DTXZAHID"
+            )
+            return
+        
+        # Show approval option with buttons
+        keyboard = [
+            [InlineKeyboardButton("✅ Request Approval", callback_data="request_approval")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="cancel_approval")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            "To use this bot, you need approval from admin.\n\n"
+            "Do you want to send an approval request?",
+            reply_markup=reply_markup
+        )
+
+    async def request_approval_handler(self, query, context):
+        """Handle approval request from user"""
+        user = query.from_user
+        
+        # Check if already pending
+        existing = pending_approvals_collection.find_one({'user_id': user.id})
+        if existing:
+            await query.message.edit_text(
+                "Your approval request is already pending. Please wait for admin response."
+            )
+            return
+        
+        # Check if already approved
+        user_data = users_collection.find_one({'user_id': user.id})
+        if user_data and user_data.get('approved', False):
+            await query.message.edit_text("You are already approved! Send /start to use the bot.")
             return
         
         # Save pending approval
@@ -154,8 +252,16 @@ class CommentBot:
             'username': user.username,
             'first_name': user.first_name,
             'last_name': user.last_name,
-            'date': datetime.now()
+            'date': datetime.now(),
+            'status': 'pending'
         })
+        
+        # Update user status
+        users_collection.update_one(
+            {'user_id': user.id},
+            {'$set': {'pending': True}},
+            upsert=True
+        )
         
         # Notify admins
         for admin_id in ADMIN_IDS:
@@ -168,41 +274,84 @@ class CommentBot:
                 
                 await context.bot.send_message(
                     chat_id=admin_id,
-                    text=f"New Approval Request:\n\n"
+                    text=f"🔔 New Approval Request:\n\n"
                          f"User ID: {user.id}\n"
                          f"Username: @{user.username if user.username else 'None'}\n"
                          f"Name: {user.first_name} {user.last_name or ''}\n"
                          f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
                     reply_markup=reply_markup
                 )
-            except:
+            except Exception as e:
+                print(f"Failed to notify admin {admin_id}: {e}")
                 pass
         
-        await update.message.reply_text(
-            "Your approval request has been sent to admin. Please wait for response."
+        await query.message.edit_text(
+            "✅ Your approval request has been sent to admin!\n\n"
+            "Please wait for response. You'll be notified once approved."
         )
 
-    async def show_main_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        buttons = buttons_collection.find()
+    async def handle_approval(self, query, context):
+        """Handle admin approval/rejection"""
+        if query.from_user.id not in ADMIN_IDS:
+            await query.answer("You are not authorized!")
+            return
         
-        keyboard = []
-        for button in buttons:
-            keyboard.append([InlineKeyboardButton(
-                button['button_name'], 
-                callback_data=f"button_{button['button_id']}"
-            )])
+        data = query.data
+        user_id = int(data.split('_')[1])
         
-        # Add admin panel button if user is admin
-        if update.effective_user.id in ADMIN_IDS:
-            keyboard.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel")])
-        
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        message = update.message if update.message else update.callback_query.message
-        await message.reply_text(
-            "Welcome To Comment Provider Bot By Zahid\n\nPlease select an app:",
-            reply_markup=reply_markup
-        )
+        if data.startswith("approve"):
+            # Approve user
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$set': {
+                    'approved': True, 
+                    'rejected': False,
+                    'pending': False
+                }},
+                upsert=True
+            )
+            pending_approvals_collection.delete_one({'user_id': user_id})
+            
+            # Notify user
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text="✅ Welcome To Comment Provider Bot By Zahid!\n\n"
+                         "Your approval request has been accepted!\n"
+                         "Send /start to begin using the bot."
+                )
+            except Exception as e:
+                print(f"Failed to notify user {user_id}: {e}")
+            
+            await query.message.edit_text(
+                query.message.text + "\n\n✅ User approved successfully!"
+            )
+        else:
+            # Reject user
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$set': {
+                    'approved': False, 
+                    'rejected': True,
+                    'pending': False
+                }},
+                upsert=True
+            )
+            pending_approvals_collection.delete_one({'user_id': user_id})
+            
+            # Notify user
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text="❌ Sorry But Your Approval Has Been Rejected By Owner.\n\n"
+                         "If You Have Any Issue Contact To @DTXZAHID"
+                )
+            except Exception as e:
+                print(f"Failed to notify user {user_id}: {e}")
+            
+            await query.message.edit_text(
+                query.message.text + "\n\n❌ User rejected!"
+            )
 
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
@@ -210,8 +359,12 @@ class CommentBot:
         
         data = query.data
         
-        if data == "check_join":
-            await self.check_force_join_after_button(query, context)
+        if data == "request_approval":
+            await self.request_approval_handler(query, context)
+        elif data == "cancel_approval":
+            await query.message.edit_text("Approval request cancelled. Send /start if you change your mind.")
+        elif data == "check_join_before_approval":
+            await self.check_join_before_approval(query, context)
         elif data.startswith("approve_") or data.startswith("reject_"):
             await self.handle_approval(query, context)
         elif data == "admin_panel":
@@ -282,7 +435,8 @@ class CommentBot:
             await query.message.edit_text("✅ Button removed successfully!")
             await self.show_manage_buttons(query, context)
 
-    async def check_force_join_after_button(self, query, context):
+    async def check_join_before_approval(self, query, context):
+        """Check if user has joined all channels before showing approval option"""
         channels = list(channels_collection.find())
         user_id = query.from_user.id
         not_joined = []
@@ -303,106 +457,89 @@ class CommentBot:
                     url=channel['channel_link']
                 )])
             
-            keyboard.append([InlineKeyboardButton("✅ I've Joined", callback_data="check_join")])
+            keyboard.append([InlineKeyboardButton("✅ I've Joined", callback_data="check_join_before_approval")])
             reply_markup = InlineKeyboardMarkup(keyboard)
             await query.message.edit_text(
                 "You haven't joined all channels yet. Please join:",
                 reply_markup=reply_markup
             )
         else:
-            await self.request_approval_from_callback(query, context)
+            # Show approval option
+            keyboard = [
+                [InlineKeyboardButton("✅ Request Approval", callback_data="request_approval")],
+                [InlineKeyboardButton("❌ Cancel", callback_data="cancel_approval")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.message.edit_text(
+                "✅ You've joined all channels!\n\n"
+                "Do you want to send an approval request?",
+                reply_markup=reply_markup
+            )
 
-    async def request_approval_from_callback(self, query, context):
-        user = query.from_user
+    async def show_main_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show main menu with buttons for approved users"""
+        buttons = list(buttons_collection.find())
         
-        existing = pending_approvals_collection.find_one({'user_id': user.id})
-        if existing:
-            await query.message.edit_text("Your approval request is already pending.")
+        if not buttons:
+            message = update.message if update.message else update.callback_query.message
+            await message.reply_text(
+                "No apps available at the moment. Please check back later."
+            )
             return
         
-        pending_approvals_collection.insert_one({
-            'user_id': user.id,
-            'username': user.username,
-            'first_name': user.first_name,
-            'last_name': user.last_name,
-            'date': datetime.now()
-        })
+        keyboard = []
+        for button in buttons:
+            keyboard.append([InlineKeyboardButton(
+                button['button_name'], 
+                callback_data=f"button_{button['button_id']}"
+            )])
         
-        for admin_id in ADMIN_IDS:
-            try:
-                keyboard = [
-                    [InlineKeyboardButton("✅ Approve", callback_data=f"approve_{user.id}"),
-                     InlineKeyboardButton("❌ Reject", callback_data=f"reject_{user.id}")]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                
-                await context.bot.send_message(
-                    chat_id=admin_id,
-                    text=f"New Approval Request:\n\n"
-                         f"User ID: {user.id}\n"
-                         f"Username: @{user.username if user.username else 'None'}\n"
-                         f"Name: {user.first_name} {user.last_name or ''}\n"
-                         f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-                    reply_markup=reply_markup
-                )
-            except:
-                pass
+        # Add admin panel button if user is admin
+        if update.effective_user.id in ADMIN_IDS:
+            keyboard.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel")])
         
-        await query.message.edit_text(
-            "Your approval request has been sent to admin. Please wait for response."
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        message = update.message if update.message else update.callback_query.message
+        await message.reply_text(
+            "Welcome To Comment Provider Bot By Zahid\n\nPlease select an app:",
+            reply_markup=reply_markup
         )
 
-    async def handle_approval(self, query, context):
+    async def show_admin_panel(self, query, context):
+        """Show admin panel from callback"""
         if query.from_user.id not in ADMIN_IDS:
-            await query.message.reply_text("You are not authorized!")
+            await query.message.reply_text("Unauthorized access!")
             return
         
-        data = query.data
-        user_id = int(data.split('_')[1])
+        settings = settings_collection.find_one()
+        bot_status = settings['bot_status']
+        status_text = "ON ✅" if bot_status else "OFF ❌"
         
-        if data.startswith("approve"):
-            # Approve user
-            users_collection.update_one(
-                {'user_id': user_id},
-                {'$set': {'approved': True, 'rejected': False}},
-                upsert=True
-            )
-            pending_approvals_collection.delete_one({'user_id': user_id})
-            
-            # Notify user
-            try:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text="Welcome To Comment Provider Bot By Zahid"
-                )
-            except:
-                pass
-            
-            await query.message.edit_text(
-                query.message.text + "\n\n✅ User approved successfully!"
-            )
+        keyboard = [
+            [InlineKeyboardButton("📢 Manage Channels", callback_data="manage_channels")],
+            [InlineKeyboardButton("🔘 Manage Buttons", callback_data="manage_buttons")],
+            [InlineKeyboardButton("➕ Add Comments", callback_data="show_buttons_for_comments")],
+            [InlineKeyboardButton("📊 View Stats", callback_data="view_stats")],
+            [InlineKeyboardButton("✏️ Set Over Message", callback_data="set_over_message")],
+            [InlineKeyboardButton("🔙 Main Menu", callback_data="back_to_main")]
+        ]
+        
+        # Add bot status button at the top
+        if bot_status:
+            keyboard.insert(0, [InlineKeyboardButton("🤖 Turn Bot OFF", callback_data="bot_off")])
         else:
-            # Reject user
-            users_collection.update_one(
-                {'user_id': user_id},
-                {'$set': {'approved': False, 'rejected': True}},
-                upsert=True
-            )
-            pending_approvals_collection.delete_one({'user_id': user_id})
-            
-            # Notify user
-            try:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text="Sorry But Your Approval Has Been Rejected By Owner. "
-                         "If You Have Any Issue Contact To @DTXZAHID"
-                )
-            except:
-                pass
-            
-            await query.message.edit_text(
-                query.message.text + "\n\n❌ User rejected!"
-            )
+            keyboard.insert(0, [InlineKeyboardButton("🤖 Turn Bot ON", callback_data="bot_on")])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.message.edit_text(
+            "⚙️ Admin Panel\n\n"
+            f"Bot Status: {status_text}\n"
+            "Select an option:",
+            reply_markup=reply_markup
+        )
 
     async def show_comment_confirmation(self, query, context, button_id):
         keyboard = [
@@ -445,39 +582,6 @@ class CommentBot:
             # No comments available
             over_message = settings_collection.find_one()['over_message']
             await query.message.edit_text(over_message)
-
-    async def show_admin_panel(self, query, context):
-        if query.from_user.id not in ADMIN_IDS:
-            await query.message.reply_text("Unauthorized access!")
-            return
-        
-        settings = settings_collection.find_one()
-        bot_status = settings['bot_status']
-        status_text = "ON ✅" if bot_status else "OFF ❌"
-        
-        keyboard = [
-            [InlineKeyboardButton("📢 Manage Channels", callback_data="manage_channels")],
-            [InlineKeyboardButton("🔘 Manage Buttons", callback_data="manage_buttons")],
-            [InlineKeyboardButton("➕ Add Comments", callback_data="show_buttons_for_comments")],
-            [InlineKeyboardButton("📊 View Stats", callback_data="view_stats")],
-            [InlineKeyboardButton("✏️ Set Over Message", callback_data="set_over_message")],
-            [InlineKeyboardButton("🔙 Back", callback_data="back_to_main")]
-        ]
-        
-        # Add bot status button at the top
-        if bot_status:
-            keyboard.insert(0, [InlineKeyboardButton("🤖 Turn Bot OFF", callback_data="bot_off")])
-        else:
-            keyboard.insert(0, [InlineKeyboardButton("🤖 Turn Bot ON", callback_data="bot_on")])
-        
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.message.edit_text(
-            "⚙️ Admin Panel\n\n"
-            f"Bot Status: {status_text}\n"
-            "Select an option:",
-            reply_markup=reply_markup
-        )
 
     async def show_manage_channels(self, query, context):
         keyboard = [
@@ -544,6 +648,10 @@ class CommentBot:
 
     async def show_button_stats(self, query, context, button_id):
         button = buttons_collection.find_one({'button_id': button_id})
+        if not button:
+            await query.message.edit_text("Button not found!")
+            return
+            
         total_comments = comments_collection.count_documents({'button_id': button_id})
         used_comments = comments_collection.count_documents({'button_id': button_id, 'used': True})
         available_comments = total_comments - used_comments
@@ -644,7 +752,13 @@ class CommentBot:
         )
 
     async def show_main_menu_from_callback(self, query, context):
-        buttons = buttons_collection.find()
+        buttons = list(buttons_collection.find())
+        
+        if not buttons:
+            await query.message.edit_text(
+                "No apps available at the moment. Please check back later."
+            )
+            return
         
         keyboard = []
         for button in buttons:
@@ -754,16 +868,11 @@ class CommentBot:
             await self.show_admin_panel_from_message(update, context)
         
         else:
-            # Check if user is approved
-            user = update.effective_user
-            user_data = users_collection.find_one({'user_id': user.id})
-            
-            if user_data and user_data.get('approved', False):
-                await self.show_main_menu(update, context)
-            else:
-                await self.start(update, context)
+            # Just start the bot
+            await self.start(update, context)
 
     async def show_admin_panel_from_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show admin panel from message"""
         # Create a fake callback query
         class FakeQuery:
             def __init__(self, user, message):
@@ -789,11 +898,14 @@ def main():
     
     # Add handlers
     application.add_handler(CommandHandler("start", bot.start))
+    application.add_handler(CommandHandler("admin", bot.admin_command))  # New /admin command
     application.add_handler(CallbackQueryHandler(bot.button_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
     
     # Start bot
     print("🤖 Bot is starting...")
+    print(f"✅ Admin IDs: {ADMIN_IDS}")
+    print(f"✅ Use /admin command to access admin panel")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
