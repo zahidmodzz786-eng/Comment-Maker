@@ -1,6 +1,7 @@
 import logging
 import os
 import certifi
+import ssl
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -8,6 +9,7 @@ from telegram.ext import (
     MessageHandler, filters, ContextTypes
 )
 from pymongo import MongoClient
+from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
 
 # Enable logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -18,10 +20,37 @@ BOT_TOKEN = os.environ.get('BOT_TOKEN')
 ADMIN_IDS = list(map(int, os.environ.get('ADMIN_IDS', '').split(',')))
 MONGO_URI = os.environ.get('MONGO_URI')
 
-# MongoDB
+# ========== ROBUST MONGODB CONNECTION ==========
+connected = False
 try:
-    client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
+    # Try with certifi first
+    client = MongoClient(
+        MONGO_URI,
+        tlsCAFile=certifi.where(),
+        serverSelectionTimeoutMS=30000,
+        connectTimeoutMS=30000,
+        socketTimeoutMS=45000
+    )
     client.admin.command('ping')
+    connected = True
+    print("✅ MongoDB connected with certifi")
+except Exception as e:
+    print(f"⚠️ Certifi connection failed: {e}")
+    try:
+        # Fallback: allow invalid certificates
+        client = MongoClient(
+            MONGO_URI,
+            tlsAllowInvalidCertificates=True,
+            serverSelectionTimeoutMS=30000
+        )
+        client.admin.command('ping')
+        connected = True
+        print("✅ MongoDB connected with tlsAllowInvalidCertificates=True")
+    except Exception as e2:
+        print(f"❌ All MongoDB connection attempts failed: {e2}")
+        connected = False
+
+if connected:
     db = client['comment_bot']
     users = db['users']
     channels = db['channels']
@@ -29,30 +58,34 @@ try:
     comments = db['comments']
     settings = db['settings']
     pending = db['pending']
-
+    
     if not settings.find_one():
         settings.insert_one({'bot_status': True, 'over_message': 'No more comments available.'})
-    print("✅ MongoDB connected")
-except Exception as e:
-    print(f"❌ MongoDB error: {e}")
-    # Dummy collections to prevent crashes
-    class Dummy:
+else:
+    print("❌ Using dummy collections – data will NOT persist!")
+    # Dummy collections that raise errors when used
+    class DummyCollection:
         def find_one(self, *a, **k): return None
         def find(self, *a, **k): return []
-        def insert_one(self, *a, **k): return None
-        def update_one(self, *a, **k): return None
-        def delete_one(self, *a, **k): return None
+        def insert_one(self, *a, **k): raise Exception("Database not connected")
+        def update_one(self, *a, **k): raise Exception("Database not connected")
+        def delete_one(self, *a, **k): raise Exception("Database not connected")
         def count_documents(self, *a, **k): return 0
-    users = channels = buttons = comments = settings = pending = Dummy()
+    users = channels = buttons = comments = settings = pending = DummyCollection()
 
+# ========== BOT CLASS ==========
 class Bot:
     def __init__(self):
         self.load_settings()
 
     def load_settings(self):
-        s = settings.find_one()
-        self.bot_on = s.get('bot_status', True) if s else True
-        self.over_msg = s.get('over_message', 'No more comments.') if s else 'No more comments.'
+        if connected:
+            s = settings.find_one()
+            self.bot_on = s.get('bot_status', True) if s else True
+            self.over_msg = s.get('over_message', 'No more comments.') if s else 'No more comments.'
+        else:
+            self.bot_on = True
+            self.over_msg = 'No more comments.'
 
     # ========== START ==========
     async def start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -65,10 +98,9 @@ class Bot:
         if not self.bot_on:
             return await update.message.reply_text("No Apps Available For Comment")
 
-        u = users.find_one({'user_id': uid})
+        u = users.find_one({'user_id': uid}) if connected else None
         if u and u.get('approved'):
-            # Show main menu
-            btns = list(buttons.find())
+            btns = list(buttons.find()) if connected else []
             if not btns:
                 return await update.message.reply_text("No apps yet.")
             keyboard = [[InlineKeyboardButton(b['button_name'], callback_data=f"btn_{b['button_id']}")] for b in btns]
@@ -79,8 +111,7 @@ class Bot:
         elif u and u.get('pending'):
             return await update.message.reply_text("Your approval is still pending. Please wait.")
         else:
-            # New user: check channels
-            ch_list = list(channels.find())
+            ch_list = list(channels.find()) if connected else []
             if not ch_list:
                 return await self.request_approval_prompt(update, ctx)
 
@@ -111,6 +142,9 @@ class Bot:
 
     # ========== APPROVAL ==========
     async def ask_approval(self, query, ctx):
+        if not connected:
+            await query.message.edit_text("Database offline. Cannot request approval.")
+            return
         user = query.from_user
         uid = user.id
 
@@ -165,6 +199,9 @@ class Bot:
         await query.message.edit_text("Do you really want this app comment?\nNote: If you don't do 2-3 apps you may be banned.", reply_markup=InlineKeyboardMarkup(kb))
 
     async def give_comment(self, query, btn_id):
+        if not connected:
+            await query.message.edit_text("Database offline. Cannot retrieve comment.")
+            return
         com = comments.find_one_and_delete({'button_id': btn_id, 'used': False}, sort=[('_id', 1)])
         if com:
             comments.update_one({'_id': com['_id']}, {'$set': {'used': True, 'used_by': query.from_user.id, 'used_date': datetime.now()}})
@@ -175,15 +212,19 @@ class Bot:
 
     # ========== ADMIN PANEL ==========
     async def admin_panel(self, update, ctx, edit=False):
-        s = settings.find_one() or {}
-        status = "ON ✅" if s.get('bot_status', True) else "OFF ❌"
-        kb = [
-            [InlineKeyboardButton(f"🤖 Turn {'OFF' if s.get('bot_status') else 'ON'}", callback_data="toggle")],
-            [InlineKeyboardButton("📢 Channels", callback_data="menu_channels"), InlineKeyboardButton("🔘 Buttons", callback_data="menu_buttons")],
-            [InlineKeyboardButton("➕ Add Comments", callback_data="menu_add_comments"), InlineKeyboardButton("📊 Stats", callback_data="menu_stats")],
-            [InlineKeyboardButton("✏️ Over Message", callback_data="menu_overmsg"), InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu")]
-        ]
-        text = f"⚙️ Admin Panel\nBot Status: {status}"
+        if not connected:
+            text = "⚠️ Database offline. Admin panel limited."
+            kb = [[InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu")]]
+        else:
+            s = settings.find_one() or {}
+            status = "ON ✅" if s.get('bot_status', True) else "OFF ❌"
+            kb = [
+                [InlineKeyboardButton(f"🤖 Turn {'OFF' if s.get('bot_status') else 'ON'}", callback_data="toggle")],
+                [InlineKeyboardButton("📢 Channels", callback_data="menu_channels"), InlineKeyboardButton("🔘 Buttons", callback_data="menu_buttons")],
+                [InlineKeyboardButton("➕ Add Comments", callback_data="menu_add_comments"), InlineKeyboardButton("📊 Stats", callback_data="menu_stats")],
+                [InlineKeyboardButton("✏️ Over Message", callback_data="menu_overmsg"), InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu")]
+            ]
+            text = f"⚙️ Admin Panel\nBot Status: {status}"
         if edit:
             await update.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb))
         else:
@@ -191,6 +232,9 @@ class Bot:
 
     # ========== CHANNELS ==========
     async def menu_channels(self, query):
+        if not connected:
+            await query.message.edit_text("Database offline. Cannot manage channels.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin")]]))
+            return
         chans = list(channels.find())
         txt = "📢 Channels:\n" + ("\n".join([f"• {c['channel_name']}" for c in chans]) if chans else "No channels.")
         kb = [
@@ -205,6 +249,9 @@ class Bot:
         await query.message.reply_text("Send the channel username or ID:")
 
     async def remove_channel(self, query):
+        if not connected:
+            await query.message.edit_text("Database offline. Cannot remove channels.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin")]]))
+            return
         chans = list(channels.find())
         if not chans:
             await query.message.edit_text("No channels to remove.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="menu_channels")]]))
@@ -219,6 +266,9 @@ class Bot:
 
     # ========== BUTTONS ==========
     async def menu_buttons(self, query):
+        if not connected:
+            await query.message.edit_text("Database offline. Cannot manage buttons.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin")]]))
+            return
         btns = list(buttons.find())
         txt = "🔘 Buttons:\n" + ("\n".join([f"• {b['button_name']}" for b in btns]) if btns else "No buttons.")
         kb = [
@@ -233,6 +283,9 @@ class Bot:
         await query.message.reply_text("Send the button name:")
 
     async def remove_button(self, query):
+        if not connected:
+            await query.message.edit_text("Database offline. Cannot remove buttons.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin")]]))
+            return
         btns = list(buttons.find())
         if not btns:
             await query.message.edit_text("No buttons to remove.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="menu_buttons")]]))
@@ -248,6 +301,9 @@ class Bot:
 
     # ========== ADD COMMENTS ==========
     async def menu_add_comments(self, query):
+        if not connected:
+            await query.message.edit_text("Database offline. Cannot add comments.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin")]]))
+            return
         btns = list(buttons.find())
         if not btns:
             await query.message.edit_text("No buttons yet. Add one first.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin")]]))
@@ -263,6 +319,9 @@ class Bot:
 
     # ========== STATS ==========
     async def menu_stats(self, query):
+        if not connected:
+            await query.message.edit_text("Database offline. Cannot view stats.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin")]]))
+            return
         btns = list(buttons.find())
         if not btns:
             await query.message.edit_text("No buttons.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin")]]))
@@ -285,6 +344,9 @@ class Bot:
 
     # ========== TOGGLE BOT ==========
     async def toggle_bot(self, query):
+        if not connected:
+            await query.message.edit_text("Database offline. Cannot toggle bot.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin")]]))
+            return
         s = settings.find_one() or {}
         new = not s.get('bot_status', True)
         settings.update_one({}, {'$set': {'bot_status': new}}, upsert=True)
@@ -292,13 +354,12 @@ class Bot:
         await query.message.edit_text(f"Bot turned {'ON' if new else 'OFF'}!")
         await self.admin_panel(query, None, edit=True)
 
-    # ========== MESSAGE HANDLER (for all text inputs) ==========
+    # ========== MESSAGE HANDLER ==========
     async def handle_message(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         text = update.message.text
         action = ctx.user_data.get('action')
 
-        # Only admins can use admin actions
         if user_id not in ADMIN_IDS:
             await self.start(update, ctx)
             return
@@ -310,18 +371,34 @@ class Bot:
         elif action == 'add_channel_link':
             name = ctx.user_data.pop('chan_name')
             link = text
-            chan_id = str(datetime.now().timestamp()).replace('.', '')  # FIXED
+            if not connected:
+                await update.message.reply_text("❌ Database offline. Cannot add channel.")
+                ctx.user_data.pop('action', None)
+                await self.admin_panel(update, ctx)
+                return
+            chan_id = str(datetime.now().timestamp()).replace('.', '')
             channels.insert_one({'channel_id': chan_id, 'channel_name': name, 'channel_link': link})
             await update.message.reply_text("✅ Channel added!")
             ctx.user_data.pop('action', None)
             await self.admin_panel(update, ctx)
         elif action == 'add_button':
-            btn_id = str(datetime.now().timestamp()).replace('.', '')  # FIXED
+            if not connected:
+                await update.message.reply_text("❌ Database offline. Cannot add button.")
+                ctx.user_data.pop('action', None)
+                await self.admin_panel(update, ctx)
+                return
+            btn_id = str(datetime.now().timestamp()).replace('.', '')
             buttons.insert_one({'button_id': btn_id, 'button_name': text})
             await update.message.reply_text("✅ Button added!")
             ctx.user_data.pop('action', None)
             await self.admin_panel(update, ctx)
         elif action == 'add_comments':
+            if not connected:
+                await update.message.reply_text("❌ Database offline. Cannot add comments.")
+                ctx.user_data.pop('action', None)
+                ctx.user_data.pop('com_btn', None)
+                await self.admin_panel(update, ctx)
+                return
             btn_id = ctx.user_data.get('com_btn')
             coms = [c.strip() for c in text.split(',') if c.strip()]
             for c in coms:
@@ -331,6 +408,11 @@ class Bot:
             ctx.user_data.pop('com_btn', None)
             await self.admin_panel(update, ctx)
         elif action == 'over_msg':
+            if not connected:
+                await update.message.reply_text("❌ Database offline. Cannot set over message.")
+                ctx.user_data.pop('action', None)
+                await self.admin_panel(update, ctx)
+                return
             settings.update_one({}, {'$set': {'over_message': text}}, upsert=True)
             self.over_msg = text
             await update.message.reply_text("✅ Over message updated!")
@@ -362,6 +444,9 @@ class Bot:
             await self.give_comment(q, data[6:])
             return
         if data == "main_menu":
+            if not connected:
+                await q.message.edit_text("Database offline.")
+                return
             btns = list(buttons.find())
             if not btns:
                 await q.message.edit_text("No apps yet.")
