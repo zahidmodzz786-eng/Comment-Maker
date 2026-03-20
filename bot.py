@@ -37,7 +37,6 @@ except Exception as e:
 if connected:
     db = client['comment_bot']
     users = db['users']
-    channels = db['channels']
     buttons = db['buttons']
     comments = db['comments']
     settings = db['settings']
@@ -52,7 +51,7 @@ else:
         def update_one(self,*a,**k): raise Exception("Database offline")
         def delete_one(self,*a,**k): raise Exception("Database offline")
         def count_documents(self,*a,**k): return 0
-    users = channels = buttons = comments = settings = pending = Dummy()
+    users = buttons = comments = settings = pending = Dummy()
 
 # ---------- Bot Class ----------
 class Bot:
@@ -73,14 +72,18 @@ class Bot:
         user = update.effective_user
         uid = user.id
 
+        # Admin gets admin panel
         if uid in ADMIN_IDS:
             return await self.admin_panel(update, ctx)
 
+        # Bot off?
         if not self.bot_on:
             return await update.message.reply_text("❌ No Apps Available For Comment")
 
+        # Check user status
         u = users.find_one({'user_id': uid}) if connected else None
         if u and u.get('approved'):
+            # Approved user: show main menu
             btns = list(buttons.find()) if connected else []
             if not btns:
                 return await update.message.reply_text("📭 No apps available yet.")
@@ -94,31 +97,8 @@ class Bot:
         elif u and u.get('pending'):
             await update.message.reply_text("⏳ Your approval is still pending. Please wait.")
         else:
-            ch_list = list(channels.find()) if connected else []
-            if not ch_list:
-                return await self.request_approval_prompt(update, ctx)
-
-            not_joined = []
-            for ch in ch_list:
-                try:
-                    member = await ctx.bot.get_chat_member(chat_id=ch['channel_id'], user_id=uid)
-                    if member.status not in ['member', 'administrator', 'creator']:
-                        not_joined.append(ch)
-                except Exception as e:
-                    print(f"⚠️ Error checking channel {ch.get('channel_name')}: {e}")
-                    not_joined.append(ch)
-
-            if not_joined:
-                keyboard = []
-                for ch in not_joined:
-                    keyboard.append([InlineKeyboardButton(f"🔗 Join {ch['channel_name']}", url=ch['channel_link'])])
-                keyboard.append([InlineKeyboardButton("✅ I've Joined", callback_data="check_join")])
-                await update.message.reply_text(
-                    "📢 Please join these channels first:",
-                    reply_markup=InlineKeyboardMarkup(keyboard)
-                )
-            else:
-                await self.request_approval_prompt(update, ctx)
+            # New user: ask for approval
+            await self.request_approval_prompt(update, ctx)
 
     async def request_approval_prompt(self, update, ctx):
         keyboard = [
@@ -194,6 +174,7 @@ class Bot:
             return
         uid = query.from_user.id
 
+        # Check if user already got a comment for this button
         already = comments.find_one({'button_id': btn_id, 'used': True, 'used_by': uid})
         if already:
             await query.message.edit_text(
@@ -228,7 +209,7 @@ class Bot:
             status = "ON ✅" if s.get('bot_status', True) else "OFF ❌"
             kb = [
                 [InlineKeyboardButton(f"🤖 Turn {'OFF' if s.get('bot_status') else 'ON'}", callback_data="toggle")],
-                [InlineKeyboardButton("📢 Channels", callback_data="menu_channels"), InlineKeyboardButton("🔘 Buttons", callback_data="menu_buttons")],
+                [InlineKeyboardButton("🔘 Buttons", callback_data="menu_buttons")],
                 [InlineKeyboardButton("➕ Add Comments", callback_data="menu_add_comments"), InlineKeyboardButton("📊 Stats", callback_data="menu_stats")],
                 [InlineKeyboardButton("✏️ Over Message", callback_data="menu_overmsg"), InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu")]
             ]
@@ -237,40 +218,6 @@ class Bot:
             await update.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb))
         else:
             await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
-
-    # ========== CHANNELS ==========
-    async def menu_channels(self, query):
-        if not connected:
-            await query.message.edit_text("❌ Database offline.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin")]]))
-            return
-        chans = list(channels.find())
-        txt = "📢 Channels:\n" + ("\n".join([f"• {c['channel_name']}" for c in chans]) if chans else "No channels.")
-        kb = [
-            [InlineKeyboardButton("➕ Add", callback_data="add_channel")],
-            [InlineKeyboardButton("❌ Remove", callback_data="remove_channel")],
-            [InlineKeyboardButton("🔙 Back", callback_data="admin")]
-        ]
-        await query.message.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
-
-    async def add_channel_start(self, query, ctx):
-        ctx.user_data['action'] = 'add_channel'
-        await query.message.reply_text("📝 Send the channel username (e.g., @mychannel) or channel ID:")
-
-    async def remove_channel(self, query):
-        if not connected:
-            await query.message.edit_text("❌ Database offline.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin")]]))
-            return
-        chans = list(channels.find())
-        if not chans:
-            await query.message.edit_text("No channels to remove.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="menu_channels")]]))
-            return
-        kb = [[InlineKeyboardButton(f"❌ Remove {c['channel_name']}", callback_data=f"delchan_{c['channel_id']}")] for c in chans]
-        kb.append([InlineKeyboardButton("🔙 Back", callback_data="menu_channels")])
-        await query.message.edit_text("Select channel to remove:", reply_markup=InlineKeyboardMarkup(kb))
-
-    async def delete_channel(self, query, chan_id):
-        channels.delete_one({'channel_id': chan_id})
-        await query.message.edit_text("✅ Channel removed.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="menu_channels")]]))
 
     # ========== BUTTONS ==========
     async def menu_buttons(self, query):
@@ -381,43 +328,7 @@ class Bot:
             await self.start(update, ctx)
             return
 
-        if action == 'add_channel':
-            ctx.user_data['chan_name'] = text
-            ctx.user_data['action'] = 'add_channel_link'
-            await update.message.reply_text("🔗 Now send the channel invite link (e.g., https://t.me/...):")
-        elif action == 'add_channel_link':
-            name = ctx.user_data.pop('chan_name')
-            link = text
-            # Verify bot is admin in the channel
-            try:
-                if link.startswith('https://t.me/'):
-                    chat_id = link.replace('https://t.me/', '@')
-                else:
-                    chat_id = link
-                bot_member = await ctx.bot.get_chat_member(chat_id=chat_id, user_id=ctx.bot.id)
-                if bot_member.status not in ['administrator', 'creator']:
-                    await update.message.reply_text(
-                        "❌ I am not an admin in that channel.\n"
-                        "Please add me as admin first, then click /admin and try again.",
-                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin")]])
-                    )
-                    ctx.user_data.pop('action', None)
-                    return
-            except Exception as e:
-                await update.message.reply_text(
-                    f"❌ Could not verify admin status: {e}\n"
-                    "Make sure I am added as admin in the channel and the link is correct.",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin")]])
-                )
-                ctx.user_data.pop('action', None)
-                return
-
-            chan_id = str(datetime.now().timestamp()).replace('.', '')
-            channels.insert_one({'channel_id': chan_id, 'channel_name': name, 'channel_link': link})
-            await update.message.reply_text("✅ Channel added successfully!")
-            ctx.user_data.pop('action', None)
-            await self.admin_panel(update, ctx)
-        elif action == 'add_button':
+        if action == 'add_button':
             if not connected:
                 await update.message.reply_text("❌ Database offline.")
                 ctx.user_data.pop('action', None)
@@ -457,54 +368,6 @@ class Bot:
         else:
             await self.start(update, ctx)
 
-    # ========== CHECK JOIN AFTER CLICK ==========
-    async def check_join_after_click(self, query, ctx):
-        user_id = query.from_user.id
-        ch_list = list(channels.find()) if connected else []
-        if not ch_list:
-            # No channels, go to approval
-            keyboard = [
-                [InlineKeyboardButton("✅ Request Approval", callback_data="ask_approval")],
-                [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
-            ]
-            await query.message.edit_text(
-                "🔐 You need admin approval to use this bot.\n\nDo you want to send a request?",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-            return
-
-        not_joined = []
-        for ch in ch_list:
-            try:
-                member = await ctx.bot.get_chat_member(chat_id=ch['channel_id'], user_id=user_id)
-                if member.status not in ['member', 'administrator', 'creator']:
-                    not_joined.append(ch)
-                else:
-                    print(f"✅ User {user_id} is member of {ch['channel_name']}")
-            except Exception as e:
-                print(f"⚠️ Error checking channel {ch.get('channel_name')}: {e}")
-                not_joined.append(ch)
-
-        if not_joined:
-            keyboard = []
-            for ch in not_joined:
-                keyboard.append([InlineKeyboardButton(f"🔗 Join {ch['channel_name']}", url=ch['channel_link'])])
-            keyboard.append([InlineKeyboardButton("✅ I've Joined", callback_data="check_join")])
-            await query.message.edit_text(
-                "📢 You still need to join these channels:",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-        else:
-            # All joined, show approval prompt
-            keyboard = [
-                [InlineKeyboardButton("✅ Request Approval", callback_data="ask_approval")],
-                [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
-            ]
-            await query.message.edit_text(
-                "🔐 You need admin approval to use this bot.\n\nDo you want to send a request?",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-
     # ========== CALLBACK HANDLER ==========
     async def callback_handler(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
@@ -512,9 +375,6 @@ class Bot:
         data = q.data
 
         # Public callbacks
-        if data == "check_join":
-            await self.check_join_after_click(q, ctx)
-            return
         if data == "ask_approval":
             await self.ask_approval(q, ctx)
             return
@@ -555,20 +415,6 @@ class Bot:
             return
         if data.startswith("app_") or data.startswith("rej_"):
             await self.handle_approval(q, ctx)
-            return
-
-        # Channels
-        if data == "menu_channels":
-            await self.menu_channels(q)
-            return
-        if data == "add_channel":
-            await self.add_channel_start(q, ctx)
-            return
-        if data == "remove_channel":
-            await self.remove_channel(q)
-            return
-        if data.startswith("delchan_"):
-            await self.delete_channel(q, data[8:])
             return
 
         # Buttons
