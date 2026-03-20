@@ -1,4 +1,3 @@
-
 import logging
 import os
 import certifi
@@ -74,14 +73,18 @@ class Bot:
         user = update.effective_user
         uid = user.id
 
+        # Admin gets admin panel
         if uid in ADMIN_IDS:
             return await self.admin_panel(update, ctx)
 
+        # Bot off?
         if not self.bot_on:
             return await update.message.reply_text("❌ No Apps Available For Comment")
 
+        # Check user status
         u = users.find_one({'user_id': uid}) if connected else None
         if u and u.get('approved'):
+            # Approved user: show main menu
             btns = list(buttons.find()) if connected else []
             if not btns:
                 return await update.message.reply_text("📭 No apps available yet.")
@@ -95,9 +98,11 @@ class Bot:
         elif u and u.get('pending'):
             await update.message.reply_text("⏳ Your approval is still pending. Please wait.")
         else:
+            # New user: check channels
             ch_list = list(channels.find()) if connected else []
             if not ch_list:
                 return await self.request_approval_prompt(update, ctx)
+
             not_joined = []
             for ch in ch_list:
                 try:
@@ -106,6 +111,7 @@ class Bot:
                         not_joined.append(ch)
                 except:
                     not_joined.append(ch)
+
             if not_joined:
                 keyboard = []
                 for ch in not_joined:
@@ -228,7 +234,7 @@ class Bot:
             kb = [
                 [InlineKeyboardButton(f"🤖 Turn {'OFF' if s.get('bot_status') else 'ON'}", callback_data="toggle")],
                 [InlineKeyboardButton("📢 Channels", callback_data="menu_channels"), InlineKeyboardButton("🔘 Buttons", callback_data="menu_buttons")],
-                [InlineKeyboardButton("➕ Add Comments", callback_data="menu_add_comments"), InInlineKeyboardButton("📊 Stats", callback_data="menu_stats")],
+                [InlineKeyboardButton("➕ Add Comments", callback_data="menu_add_comments"), InlineKeyboardButton("📊 Stats", callback_data="menu_stats")],
                 [InlineKeyboardButton("✏️ Over Message", callback_data="menu_overmsg"), InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu")]
             ]
             text = f"⚙️ Admin Panel\n\nBot Status: {status}"
@@ -237,7 +243,7 @@ class Bot:
         else:
             await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
 
-    # ========== CHANNELS (with bot admin check) ==========
+    # ========== CHANNELS ==========
     async def menu_channels(self, query):
         if not connected:
             await query.message.edit_text("❌ Database offline.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin")]]))
