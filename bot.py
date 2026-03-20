@@ -246,10 +246,11 @@ class Bot:
             return
         uid = query.from_user.id
 
+        # Check if user already got a comment for this button
         already = comments.find_one({'button_id': btn_id, 'used': True, 'used_by': uid})
         if already:
             await query.message.edit_text(
-                "Contact Owner For More Comments Already 1 Given Dm To @DTXZAHID",
+                "Already Comment Given Want More Comments? Dm @DTXZAHID",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu")]])
             )
             return
