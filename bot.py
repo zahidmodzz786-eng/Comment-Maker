@@ -73,18 +73,14 @@ class Bot:
         user = update.effective_user
         uid = user.id
 
-        # Admin gets admin panel
         if uid in ADMIN_IDS:
             return await self.admin_panel(update, ctx)
 
-        # Bot off?
         if not self.bot_on:
             return await update.message.reply_text("❌ No Apps Available For Comment")
 
-        # Check user status
         u = users.find_one({'user_id': uid}) if connected else None
         if u and u.get('approved'):
-            # Approved user: show main menu
             btns = list(buttons.find()) if connected else []
             if not btns:
                 return await update.message.reply_text("📭 No apps available yet.")
@@ -98,7 +94,6 @@ class Bot:
         elif u and u.get('pending'):
             await update.message.reply_text("⏳ Your approval is still pending. Please wait.")
         else:
-            # New user: check channels
             ch_list = list(channels.find()) if connected else []
             if not ch_list:
                 return await self.request_approval_prompt(update, ctx)
@@ -109,7 +104,8 @@ class Bot:
                     member = await ctx.bot.get_chat_member(chat_id=ch['channel_id'], user_id=uid)
                     if member.status not in ['member', 'administrator', 'creator']:
                         not_joined.append(ch)
-                except:
+                except Exception as e:
+                    print(f"⚠️ Error checking channel {ch.get('channel_name')}: {e}")
                     not_joined.append(ch)
 
             if not_joined:
@@ -198,7 +194,6 @@ class Bot:
             return
         uid = query.from_user.id
 
-        # Check if user already got a comment for this button
         already = comments.find_one({'button_id': btn_id, 'used': True, 'used_by': uid})
         if already:
             await query.message.edit_text(
@@ -376,13 +371,12 @@ class Bot:
         await query.message.edit_text(f"✅ Bot turned {'ON' if new else 'OFF'}!")
         await self.admin_panel(query, None, edit=True)
 
-    # ========== MESSAGE HANDLER (for all text inputs) ==========
+    # ========== MESSAGE HANDLER ==========
     async def handle_message(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         text = update.message.text
         action = ctx.user_data.get('action')
 
-        # Only admins can perform admin actions
         if user_id not in ADMIN_IDS:
             await self.start(update, ctx)
             return
@@ -396,12 +390,10 @@ class Bot:
             link = text
             # Verify bot is admin in the channel
             try:
-                # Extract channel username from link or use name as ID
                 if link.startswith('https://t.me/'):
                     chat_id = link.replace('https://t.me/', '@')
                 else:
-                    chat_id = link  # assume it's already a username or ID
-                # Try to get chat member for the bot itself
+                    chat_id = link
                 bot_member = await ctx.bot.get_chat_member(chat_id=chat_id, user_id=ctx.bot.id)
                 if bot_member.status not in ['administrator', 'creator']:
                     await update.message.reply_text(
@@ -420,7 +412,6 @@ class Bot:
                 ctx.user_data.pop('action', None)
                 return
 
-            # Save channel
             chan_id = str(datetime.now().timestamp()).replace('.', '')
             channels.insert_one({'channel_id': chan_id, 'channel_name': name, 'channel_link': link})
             await update.message.reply_text("✅ Channel added successfully!")
@@ -466,7 +457,7 @@ class Bot:
         else:
             await self.start(update, ctx)
 
-    # ========== CHECK JOIN AFTER CLICK (FIX) ==========
+    # ========== CHECK JOIN AFTER CLICK ==========
     async def check_join_after_click(self, query, ctx):
         user_id = query.from_user.id
         ch_list = list(channels.find()) if connected else []
@@ -488,17 +479,19 @@ class Bot:
                 member = await ctx.bot.get_chat_member(chat_id=ch['channel_id'], user_id=user_id)
                 if member.status not in ['member', 'administrator', 'creator']:
                     not_joined.append(ch)
-            except:
+                else:
+                    print(f"✅ User {user_id} is member of {ch['channel_name']}")
+            except Exception as e:
+                print(f"⚠️ Error checking channel {ch.get('channel_name')}: {e}")
                 not_joined.append(ch)
 
         if not_joined:
-            # Update the current message with same join buttons
             keyboard = []
             for ch in not_joined:
                 keyboard.append([InlineKeyboardButton(f"🔗 Join {ch['channel_name']}", url=ch['channel_link'])])
             keyboard.append([InlineKeyboardButton("✅ I've Joined", callback_data="check_join")])
             await query.message.edit_text(
-                "📢 Please join these channels first:",
+                "📢 You still need to join these channels:",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
         else:
