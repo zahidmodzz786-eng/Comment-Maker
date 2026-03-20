@@ -5,7 +5,7 @@ from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, filters, ContextTypes, ConversationHandler
+    MessageHandler, filters, ContextTypes
 )
 from pymongo import MongoClient
 
@@ -17,9 +17,6 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 ADMIN_IDS = list(map(int, os.environ.get('ADMIN_IDS', '').split(',')))
 MONGO_URI = os.environ.get('MONGO_URI')
-
-# Conversation states for admin actions
-WAITING_USER_ID = 1
 
 # ---------- MongoDB Connection ----------
 connected = False
@@ -158,14 +155,13 @@ class Bot:
     async def allow_user_start(self, query, ctx):
         ctx.user_data['action'] = 'allow_user'
         await query.message.reply_text("📝 Send the user ID of the user you want to allow:")
-        return WAITING_USER_ID
 
     async def allow_user_id(self, update, ctx):
         try:
             uid = int(update.message.text)
         except ValueError:
             await update.message.reply_text("❌ Invalid user ID. Please send a numeric ID.")
-            return WAITING_USER_ID
+            return
         users.update_one({'user_id': uid}, {'$set': {'approved': True, 'rejected': False, 'pending': False}}, upsert=True)
         pending.delete_one({'user_id': uid})
         try:
@@ -175,20 +171,18 @@ class Bot:
         await update.message.reply_text(f"✅ User {uid} has been allowed.")
         ctx.user_data.pop('action', None)
         await self.admin_panel(update, ctx)
-        return ConversationHandler.END
 
     # ========== ADMIN: Ban User ==========
     async def ban_user_start(self, query, ctx):
         ctx.user_data['action'] = 'ban_user'
         await query.message.reply_text("📝 Send the user ID of the user you want to ban:")
-        return WAITING_USER_ID
 
     async def ban_user_id(self, update, ctx):
         try:
             uid = int(update.message.text)
         except ValueError:
             await update.message.reply_text("❌ Invalid user ID. Please send a numeric ID.")
-            return WAITING_USER_ID
+            return
         users.update_one({'user_id': uid}, {'$set': {'approved': False, 'rejected': True, 'pending': False}}, upsert=True)
         pending.delete_one({'user_id': uid})
         try:
@@ -198,7 +192,6 @@ class Bot:
         await update.message.reply_text(f"✅ User {uid} has been banned.")
         ctx.user_data.pop('action', None)
         await self.admin_panel(update, ctx)
-        return ConversationHandler.END
 
     # ========== ADMIN: Comment Users ==========
     async def menu_comment_users(self, query):
@@ -218,12 +211,10 @@ class Bot:
         if not btn:
             await query.message.edit_text("Button not found.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="menu_comment_users")]]))
             return
-        # Get all used comments for this button, sorted by used_date (most recent last)
         used_comments = list(comments.find({'button_id': btn_id, 'used': True}).sort('used_date', 1))
         if not used_comments:
             await query.message.edit_text(f"No users have taken comments for {btn['button_name']} yet.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="menu_comment_users")]]))
             return
-        # Build message
         msg = f"📝 Users who took comments for *{btn['button_name']}*:\n\n"
         for idx, c in enumerate(used_comments, 1):
             uid = c.get('used_by')
@@ -231,7 +222,6 @@ class Bot:
             username = c.get('user_username', '')
             username_str = f"@{username}" if username else "No username"
             msg += f"{idx}. {name} ({username_str}) – ID: `{uid}`\n"
-            # Avoid message too long – if exceeds 4000 chars, truncate and add note
             if len(msg) > 3800:
                 msg += "\n... (list truncated)"
                 break
@@ -256,18 +246,16 @@ class Bot:
             return
         uid = query.from_user.id
 
-        # Check if user already got a comment for this button
         already = comments.find_one({'button_id': btn_id, 'used': True, 'used_by': uid})
         if already:
             await query.message.edit_text(
-                "🤷‍♂️ Already Given A Comment If You Want More Then Dm @DTXZAHID",
+                "Contact Owner For More Comments Already 1 Given Dm To @DTXZAHID",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu")]])
             )
             return
 
         com = comments.find_one_and_delete({'button_id': btn_id, 'used': False}, sort=[('_id', 1)])
         if com:
-            # Save user info in the comment document for later reference
             user = query.from_user
             comments.update_one({'_id': com['_id']}, {'$set': {
                 'used': True,
@@ -416,6 +404,7 @@ class Bot:
         text = update.message.text
         action = ctx.user_data.get('action')
 
+        # Only admins can perform admin actions
         if user_id not in ADMIN_IDS:
             await self.start(update, ctx)
             return
@@ -457,6 +446,10 @@ class Bot:
             await update.message.reply_text("✅ Over message updated!")
             ctx.user_data.pop('action', None)
             await self.admin_panel(update, ctx)
+        elif action == 'allow_user':
+            await self.allow_user_id(update, ctx)
+        elif action == 'ban_user':
+            await self.ban_user_id(update, ctx)
         else:
             await self.start(update, ctx)
 
@@ -561,38 +554,14 @@ class Bot:
             await self.menu_overmsg(q, ctx)
             return
 
-# ========== CONVERSATION HANDLERS ==========
-async def cancel_conversation(update, ctx):
-    await update.message.reply_text("❌ Operation cancelled.")
-    ctx.user_data.pop('action', None)
-    return ConversationHandler.END
-
 # ========== MAIN ==========
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     bot = Bot()
 
-    # Conversation handlers for allow/ban
-    allow_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(bot.allow_user_start, pattern="^allow_user$")],
-        states={
-            WAITING_USER_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot.allow_user_id)]
-        },
-        fallbacks=[CommandHandler("cancel", cancel_conversation)]
-    )
-    ban_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(bot.ban_user_start, pattern="^ban_user$")],
-        states={
-            WAITING_USER_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot.ban_user_id)]
-        },
-        fallbacks=[CommandHandler("cancel", cancel_conversation)]
-    )
-
     app.add_handler(CommandHandler("start", bot.start))
     app.add_handler(CommandHandler("admin", bot.admin_panel))
     app.add_handler(CallbackQueryHandler(bot.callback_handler))
-    app.add_handler(allow_conv)
-    app.add_handler(ban_conv)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
 
     print("🤖 Bot is running...")
