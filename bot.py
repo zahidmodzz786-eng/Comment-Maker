@@ -1,7 +1,7 @@
+
 import logging
 import os
 import certifi
-import ssl
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -9,7 +9,6 @@ from telegram.ext import (
     MessageHandler, filters, ContextTypes
 )
 from pymongo import MongoClient
-from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
 
 # Enable logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -20,35 +19,21 @@ BOT_TOKEN = os.environ.get('BOT_TOKEN')
 ADMIN_IDS = list(map(int, os.environ.get('ADMIN_IDS', '').split(',')))
 MONGO_URI = os.environ.get('MONGO_URI')
 
-# ========== ROBUST MONGODB CONNECTION ==========
+# ---------- MongoDB Connection ----------
 connected = False
 try:
-    # Try with certifi first
-    client = MongoClient(
-        MONGO_URI,
-        tlsCAFile=certifi.where(),
-        serverSelectionTimeoutMS=30000,
-        connectTimeoutMS=30000,
-        socketTimeoutMS=45000
-    )
+    client = MongoClient(MONGO_URI, tlsCAFile=certifi.where(), serverSelectionTimeoutMS=30000)
     client.admin.command('ping')
     connected = True
-    print("✅ MongoDB connected with certifi")
+    print("✅ MongoDB connected")
 except Exception as e:
-    print(f"⚠️ Certifi connection failed: {e}")
     try:
-        # Fallback: allow invalid certificates
-        client = MongoClient(
-            MONGO_URI,
-            tlsAllowInvalidCertificates=True,
-            serverSelectionTimeoutMS=30000
-        )
+        client = MongoClient(MONGO_URI, tlsAllowInvalidCertificates=True, serverSelectionTimeoutMS=30000)
         client.admin.command('ping')
         connected = True
-        print("✅ MongoDB connected with tlsAllowInvalidCertificates=True")
+        print("✅ MongoDB connected (fallback)")
     except Exception as e2:
-        print(f"❌ All MongoDB connection attempts failed: {e2}")
-        connected = False
+        print(f"❌ MongoDB failed: {e2}")
 
 if connected:
     db = client['comment_bot']
@@ -58,22 +43,19 @@ if connected:
     comments = db['comments']
     settings = db['settings']
     pending = db['pending']
-    
     if not settings.find_one():
-        settings.insert_one({'bot_status': True, 'over_message': 'No more comments available.'})
+        settings.insert_one({'bot_status': True, 'over_message': 'No more comments available for this app.'})
 else:
-    print("❌ Using dummy collections – data will NOT persist!")
-    # Dummy collections that raise errors when used
-    class DummyCollection:
-        def find_one(self, *a, **k): return None
-        def find(self, *a, **k): return []
-        def insert_one(self, *a, **k): raise Exception("Database not connected")
-        def update_one(self, *a, **k): raise Exception("Database not connected")
-        def delete_one(self, *a, **k): raise Exception("Database not connected")
-        def count_documents(self, *a, **k): return 0
-    users = channels = buttons = comments = settings = pending = DummyCollection()
+    class Dummy:
+        def find_one(self,*a,**k): return None
+        def find(self,*a,**k): return []
+        def insert_one(self,*a,**k): raise Exception("Database offline")
+        def update_one(self,*a,**k): raise Exception("Database offline")
+        def delete_one(self,*a,**k): raise Exception("Database offline")
+        def count_documents(self,*a,**k): return 0
+    users = channels = buttons = comments = settings = pending = Dummy()
 
-# ========== BOT CLASS ==========
+# ---------- Bot Class ----------
 class Bot:
     def __init__(self):
         self.load_settings()
@@ -82,10 +64,10 @@ class Bot:
         if connected:
             s = settings.find_one()
             self.bot_on = s.get('bot_status', True) if s else True
-            self.over_msg = s.get('over_message', 'No more comments.') if s else 'No more comments.'
+            self.over_msg = s.get('over_message', 'No more comments available for this app.') if s else 'No more comments available for this app.'
         else:
             self.bot_on = True
-            self.over_msg = 'No more comments.'
+            self.over_msg = 'No more comments available for this app.'
 
     # ========== START ==========
     async def start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -96,25 +78,26 @@ class Bot:
             return await self.admin_panel(update, ctx)
 
         if not self.bot_on:
-            return await update.message.reply_text("No Apps Available For Comment")
+            return await update.message.reply_text("❌ No Apps Available For Comment")
 
         u = users.find_one({'user_id': uid}) if connected else None
         if u and u.get('approved'):
             btns = list(buttons.find()) if connected else []
             if not btns:
-                return await update.message.reply_text("No apps yet.")
+                return await update.message.reply_text("📭 No apps available yet.")
             keyboard = [[InlineKeyboardButton(b['button_name'], callback_data=f"btn_{b['button_id']}")] for b in btns]
-            await update.message.reply_text("Select an app:", reply_markup=InlineKeyboardMarkup(keyboard))
-            return
+            await update.message.reply_text(
+                "🌟 Welcome To Comment Provider Bot By Zahid\n\nPlease select an app:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
         elif u and u.get('rejected'):
-            return await update.message.reply_text("Sorry, you were rejected. Contact @DTXZAHID")
+            await update.message.reply_text("❌ Sorry, your approval was rejected. Contact @DTXZAHID")
         elif u and u.get('pending'):
-            return await update.message.reply_text("Your approval is still pending. Please wait.")
+            await update.message.reply_text("⏳ Your approval is still pending. Please wait.")
         else:
             ch_list = list(channels.find()) if connected else []
             if not ch_list:
                 return await self.request_approval_prompt(update, ctx)
-
             not_joined = []
             for ch in ch_list:
                 try:
@@ -123,13 +106,15 @@ class Bot:
                         not_joined.append(ch)
                 except:
                     not_joined.append(ch)
-
             if not_joined:
                 keyboard = []
                 for ch in not_joined:
-                    keyboard.append([InlineKeyboardButton(f"Join {ch['channel_name']}", url=ch['channel_link'])])
+                    keyboard.append([InlineKeyboardButton(f"🔗 Join {ch['channel_name']}", url=ch['channel_link'])])
                 keyboard.append([InlineKeyboardButton("✅ I've Joined", callback_data="check_join")])
-                await update.message.reply_text("Please join these channels:", reply_markup=InlineKeyboardMarkup(keyboard))
+                await update.message.reply_text(
+                    "📢 Please join these channels first:",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
             else:
                 await self.request_approval_prompt(update, ctx)
 
@@ -138,39 +123,38 @@ class Bot:
             [InlineKeyboardButton("✅ Request Approval", callback_data="ask_approval")],
             [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
         ]
-        await update.message.reply_text("You need admin approval. Send request?", reply_markup=InlineKeyboardMarkup(keyboard))
+        await update.message.reply_text(
+            "🔐 You need admin approval to use this bot.\n\nDo you want to send a request?",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 
     # ========== APPROVAL ==========
     async def ask_approval(self, query, ctx):
         if not connected:
-            await query.message.edit_text("Database offline. Cannot request approval.")
+            await query.message.edit_text("❌ Database offline. Cannot request approval.")
             return
         user = query.from_user
         uid = user.id
-
         if pending.find_one({'user_id': uid}):
-            await query.message.edit_text("You already have a pending request. Please wait.")
+            await query.message.edit_text("⏳ You already have a pending request. Please wait.")
             return
         if users.find_one({'user_id': uid, 'approved': True}):
-            await query.message.edit_text("You are already approved! Send /start")
+            await query.message.edit_text("✅ You are already approved! Send /start")
             return
-
         pending.insert_one({'user_id': uid, 'username': user.username, 'first_name': user.first_name, 'date': datetime.now()})
         users.update_one({'user_id': uid}, {'$set': {'pending': True}}, upsert=True)
-
         for admin in ADMIN_IDS:
             try:
                 kb = [[InlineKeyboardButton("✅ Approve", callback_data=f"app_{uid}"),
                        InlineKeyboardButton("❌ Reject", callback_data=f"rej_{uid}")]]
-                await ctx.bot.send_message(admin, f"Approval request from {user.first_name} (@{user.username})", reply_markup=InlineKeyboardMarkup(kb))
+                await ctx.bot.send_message(admin, f"🔔 New approval request from {user.first_name} (@{user.username})", reply_markup=InlineKeyboardMarkup(kb))
             except:
                 pass
-
-        await query.message.edit_text("Request sent! You'll be notified when approved.")
+        await query.message.edit_text("✅ Request sent! You'll be notified once approved.")
 
     async def handle_approval(self, query, ctx):
         if query.from_user.id not in ADMIN_IDS:
-            return await query.answer("Not authorized")
+            return await query.answer("⛔ Unauthorized")
         data = query.data
         uid = int(data.split('_')[1])
         if data.startswith('app'):
@@ -180,7 +164,7 @@ class Bot:
                 await ctx.bot.send_message(uid, "✅ Welcome! You are approved. Send /start to use the bot.")
             except:
                 pass
-            await query.message.edit_text(query.message.text + "\n✅ Approved")
+            await query.message.edit_text(query.message.text + "\n\n✅ Approved")
         else:
             users.update_one({'user_id': uid}, {'$set': {'approved': False, 'pending': False, 'rejected': True}}, upsert=True)
             pending.delete_one({'user_id': uid})
@@ -188,7 +172,7 @@ class Bot:
                 await ctx.bot.send_message(uid, "❌ Your request was rejected. Contact @DTXZAHID")
             except:
                 pass
-            await query.message.edit_text(query.message.text + "\n❌ Rejected")
+            await query.message.edit_text(query.message.text + "\n\n❌ Rejected")
 
     # ========== COMMENT FLOW ==========
     async def confirm_comment(self, query, btn_id):
@@ -196,19 +180,42 @@ class Bot:
             [InlineKeyboardButton("✅ I Agree", callback_data=f"agree_{btn_id}")],
             [InlineKeyboardButton("❌ No", callback_data="main_menu")]
         ]
-        await query.message.edit_text("Do you really want this app comment?\nNote: If you don't do 2-3 apps you may be banned.", reply_markup=InlineKeyboardMarkup(kb))
+        await query.message.edit_text(
+            "⚠️ Do you really want this app comment?\n"
+            "Note: If you don't do 2-3 apps you may be banned.",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
 
     async def give_comment(self, query, btn_id):
         if not connected:
-            await query.message.edit_text("Database offline. Cannot retrieve comment.")
+            await query.message.edit_text("❌ Database offline.")
             return
+        uid = query.from_user.id
+
+        # Check if user already got a comment for this button
+        already = comments.find_one({'button_id': btn_id, 'used': True, 'used_by': uid})
+        if already:
+            await query.message.edit_text(
+                "🤷‍♂️ Bro, you already got 1 comment for this app.\n"
+                "If you want more, DM @DTXZAHID",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu")]])
+            )
+            return
+
         com = comments.find_one_and_delete({'button_id': btn_id, 'used': False}, sort=[('_id', 1)])
         if com:
-            comments.update_one({'_id': com['_id']}, {'$set': {'used': True, 'used_by': query.from_user.id, 'used_date': datetime.now()}})
-            await query.message.edit_text(f"Here is your comment:\n\n<code>{com['comment']}</code>", parse_mode='HTML')
+            comments.update_one({'_id': com['_id']}, {'$set': {'used': True, 'used_by': uid, 'used_date': datetime.now()}})
+            await query.message.edit_text(
+                f"✅ Here is your comment – tap and hold to copy:\n\n<code>{com['comment']}</code>",
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu")]])
+            )
         else:
             self.load_settings()
-            await query.message.edit_text(self.over_msg)
+            await query.message.edit_text(
+                f"😕 {self.over_msg}",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu")]])
+            )
 
     # ========== ADMIN PANEL ==========
     async def admin_panel(self, update, ctx, edit=False):
@@ -221,19 +228,19 @@ class Bot:
             kb = [
                 [InlineKeyboardButton(f"🤖 Turn {'OFF' if s.get('bot_status') else 'ON'}", callback_data="toggle")],
                 [InlineKeyboardButton("📢 Channels", callback_data="menu_channels"), InlineKeyboardButton("🔘 Buttons", callback_data="menu_buttons")],
-                [InlineKeyboardButton("➕ Add Comments", callback_data="menu_add_comments"), InlineKeyboardButton("📊 Stats", callback_data="menu_stats")],
+                [InlineKeyboardButton("➕ Add Comments", callback_data="menu_add_comments"), InInlineKeyboardButton("📊 Stats", callback_data="menu_stats")],
                 [InlineKeyboardButton("✏️ Over Message", callback_data="menu_overmsg"), InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu")]
             ]
-            text = f"⚙️ Admin Panel\nBot Status: {status}"
+            text = f"⚙️ Admin Panel\n\nBot Status: {status}"
         if edit:
             await update.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb))
         else:
             await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
 
-    # ========== CHANNELS ==========
+    # ========== CHANNELS (with bot admin check) ==========
     async def menu_channels(self, query):
         if not connected:
-            await query.message.edit_text("Database offline. Cannot manage channels.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin")]]))
+            await query.message.edit_text("❌ Database offline.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin")]]))
             return
         chans = list(channels.find())
         txt = "📢 Channels:\n" + ("\n".join([f"• {c['channel_name']}" for c in chans]) if chans else "No channels.")
@@ -246,28 +253,28 @@ class Bot:
 
     async def add_channel_start(self, query, ctx):
         ctx.user_data['action'] = 'add_channel'
-        await query.message.reply_text("Send the channel username or ID:")
+        await query.message.reply_text("📝 Send the channel username (e.g., @mychannel) or channel ID:")
 
     async def remove_channel(self, query):
         if not connected:
-            await query.message.edit_text("Database offline. Cannot remove channels.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin")]]))
+            await query.message.edit_text("❌ Database offline.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin")]]))
             return
         chans = list(channels.find())
         if not chans:
             await query.message.edit_text("No channels to remove.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="menu_channels")]]))
             return
-        kb = [[InlineKeyboardButton(f"Remove {c['channel_name']}", callback_data=f"delchan_{c['channel_id']}")] for c in chans]
-        kb.append([InlineKeyboardButton("Back", callback_data="menu_channels")])
+        kb = [[InlineKeyboardButton(f"❌ Remove {c['channel_name']}", callback_data=f"delchan_{c['channel_id']}")] for c in chans]
+        kb.append([InlineKeyboardButton("🔙 Back", callback_data="menu_channels")])
         await query.message.edit_text("Select channel to remove:", reply_markup=InlineKeyboardMarkup(kb))
 
     async def delete_channel(self, query, chan_id):
         channels.delete_one({'channel_id': chan_id})
-        await query.message.edit_text("✅ Channel removed.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="menu_channels")]]))
+        await query.message.edit_text("✅ Channel removed.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="menu_channels")]]))
 
     # ========== BUTTONS ==========
     async def menu_buttons(self, query):
         if not connected:
-            await query.message.edit_text("Database offline. Cannot manage buttons.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin")]]))
+            await query.message.edit_text("❌ Database offline.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin")]]))
             return
         btns = list(buttons.find())
         txt = "🔘 Buttons:\n" + ("\n".join([f"• {b['button_name']}" for b in btns]) if btns else "No buttons.")
@@ -280,54 +287,57 @@ class Bot:
 
     async def add_button_start(self, query, ctx):
         ctx.user_data['action'] = 'add_button'
-        await query.message.reply_text("Send the button name:")
+        await query.message.reply_text("📝 Send the button name:")
 
     async def remove_button(self, query):
         if not connected:
-            await query.message.edit_text("Database offline. Cannot remove buttons.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin")]]))
+            await query.message.edit_text("❌ Database offline.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin")]]))
             return
         btns = list(buttons.find())
         if not btns:
             await query.message.edit_text("No buttons to remove.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="menu_buttons")]]))
             return
-        kb = [[InlineKeyboardButton(f"Remove {b['button_name']}", callback_data=f"delbtn_{b['button_id']}")] for b in btns]
-        kb.append([InlineKeyboardButton("Back", callback_data="menu_buttons")])
+        kb = [[InlineKeyboardButton(f"❌ Remove {b['button_name']}", callback_data=f"delbtn_{b['button_id']}")] for b in btns]
+        kb.append([InlineKeyboardButton("🔙 Back", callback_data="menu_buttons")])
         await query.message.edit_text("Select button to remove:", reply_markup=InlineKeyboardMarkup(kb))
 
     async def delete_button(self, query, btn_id):
         buttons.delete_one({'button_id': btn_id})
         comments.delete_many({'button_id': btn_id})
-        await query.message.edit_text("✅ Button removed.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="menu_buttons")]]))
+        await query.message.edit_text("✅ Button removed.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="menu_buttons")]]))
 
     # ========== ADD COMMENTS ==========
     async def menu_add_comments(self, query):
         if not connected:
-            await query.message.edit_text("Database offline. Cannot add comments.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin")]]))
+            await query.message.edit_text("❌ Database offline.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin")]]))
             return
         btns = list(buttons.find())
         if not btns:
             await query.message.edit_text("No buttons yet. Add one first.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin")]]))
             return
         kb = [[InlineKeyboardButton(b['button_name'], callback_data=f"selbtn_{b['button_id']}")] for b in btns]
-        kb.append([InlineKeyboardButton("Back", callback_data="admin")])
+        kb.append([InlineKeyboardButton("🔙 Back", callback_data="admin")])
         await query.message.edit_text("Select button to add comments to:", reply_markup=InlineKeyboardMarkup(kb))
 
     async def select_button_for_comments(self, query, ctx):
         ctx.user_data['com_btn'] = query.data.replace("selbtn_", "")
         ctx.user_data['action'] = 'add_comments'
-        await query.message.reply_text("Send comments separated by commas:\nExample: Great!, Awesome!, Love it!")
+        await query.message.reply_text(
+            "📝 Send comments separated by commas:\n"
+            "Example: Great app!, Awesome!, Love it!"
+        )
 
     # ========== STATS ==========
     async def menu_stats(self, query):
         if not connected:
-            await query.message.edit_text("Database offline. Cannot view stats.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin")]]))
+            await query.message.edit_text("❌ Database offline.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin")]]))
             return
         btns = list(buttons.find())
         if not btns:
             await query.message.edit_text("No buttons.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin")]]))
             return
         kb = [[InlineKeyboardButton(b['button_name'], callback_data=f"stat_{b['button_id']}")] for b in btns]
-        kb.append([InlineKeyboardButton("Back", callback_data="admin")])
+        kb.append([InlineKeyboardButton("🔙 Back", callback_data="admin")])
         await query.message.edit_text("Select button for stats:", reply_markup=InlineKeyboardMarkup(kb))
 
     async def show_stats(self, query, btn_id):
@@ -335,31 +345,38 @@ class Bot:
         used = comments.count_documents({'button_id': btn_id, 'used': True})
         btn = buttons.find_one({'button_id': btn_id})
         name = btn['button_name'] if btn else "?"
-        await query.message.edit_text(f"📊 {name}\nTotal: {total}\nUsed: {used}\nLeft: {total-used}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="menu_stats")]]))
+        await query.message.edit_text(
+            f"📊 Stats for: {name}\n\n"
+            f"Total Comments: {total}\n"
+            f"Used Comments: {used}\n"
+            f"Remaining: {total - used}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="menu_stats")]])
+        )
 
     # ========== OVER MESSAGE ==========
     async def menu_overmsg(self, query, ctx):
         ctx.user_data['action'] = 'over_msg'
-        await query.message.reply_text("Send the new 'out of comments' message:")
+        await query.message.reply_text("📝 Send the new 'out of comments' message:")
 
     # ========== TOGGLE BOT ==========
     async def toggle_bot(self, query):
         if not connected:
-            await query.message.edit_text("Database offline. Cannot toggle bot.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin")]]))
+            await query.message.edit_text("❌ Database offline.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin")]]))
             return
         s = settings.find_one() or {}
         new = not s.get('bot_status', True)
         settings.update_one({}, {'$set': {'bot_status': new}}, upsert=True)
         self.bot_on = new
-        await query.message.edit_text(f"Bot turned {'ON' if new else 'OFF'}!")
+        await query.message.edit_text(f"✅ Bot turned {'ON' if new else 'OFF'}!")
         await self.admin_panel(query, None, edit=True)
 
-    # ========== MESSAGE HANDLER ==========
+    # ========== MESSAGE HANDLER (for all text inputs) ==========
     async def handle_message(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         text = update.message.text
         action = ctx.user_data.get('action')
 
+        # Only admins can perform admin actions
         if user_id not in ADMIN_IDS:
             await self.start(update, ctx)
             return
@@ -367,23 +384,45 @@ class Bot:
         if action == 'add_channel':
             ctx.user_data['chan_name'] = text
             ctx.user_data['action'] = 'add_channel_link'
-            await update.message.reply_text("Now send the invite link:")
+            await update.message.reply_text("🔗 Now send the channel invite link (e.g., https://t.me/...):")
         elif action == 'add_channel_link':
             name = ctx.user_data.pop('chan_name')
             link = text
-            if not connected:
-                await update.message.reply_text("❌ Database offline. Cannot add channel.")
+            # Verify bot is admin in the channel
+            try:
+                # Extract channel username from link or use name as ID
+                if link.startswith('https://t.me/'):
+                    chat_id = link.replace('https://t.me/', '@')
+                else:
+                    chat_id = link  # assume it's already a username or ID
+                # Try to get chat member for the bot itself
+                bot_member = await ctx.bot.get_chat_member(chat_id=chat_id, user_id=ctx.bot.id)
+                if bot_member.status not in ['administrator', 'creator']:
+                    await update.message.reply_text(
+                        "❌ I am not an admin in that channel.\n"
+                        "Please add me as admin first, then click /admin and try again.",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin")]])
+                    )
+                    ctx.user_data.pop('action', None)
+                    return
+            except Exception as e:
+                await update.message.reply_text(
+                    f"❌ Could not verify admin status: {e}\n"
+                    "Make sure I am added as admin in the channel and the link is correct.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin")]])
+                )
                 ctx.user_data.pop('action', None)
-                await self.admin_panel(update, ctx)
                 return
+
+            # Save channel
             chan_id = str(datetime.now().timestamp()).replace('.', '')
             channels.insert_one({'channel_id': chan_id, 'channel_name': name, 'channel_link': link})
-            await update.message.reply_text("✅ Channel added!")
+            await update.message.reply_text("✅ Channel added successfully!")
             ctx.user_data.pop('action', None)
             await self.admin_panel(update, ctx)
         elif action == 'add_button':
             if not connected:
-                await update.message.reply_text("❌ Database offline. Cannot add button.")
+                await update.message.reply_text("❌ Database offline.")
                 ctx.user_data.pop('action', None)
                 await self.admin_panel(update, ctx)
                 return
@@ -394,7 +433,7 @@ class Bot:
             await self.admin_panel(update, ctx)
         elif action == 'add_comments':
             if not connected:
-                await update.message.reply_text("❌ Database offline. Cannot add comments.")
+                await update.message.reply_text("❌ Database offline.")
                 ctx.user_data.pop('action', None)
                 ctx.user_data.pop('com_btn', None)
                 await self.admin_panel(update, ctx)
@@ -409,7 +448,7 @@ class Bot:
             await self.admin_panel(update, ctx)
         elif action == 'over_msg':
             if not connected:
-                await update.message.reply_text("❌ Database offline. Cannot set over message.")
+                await update.message.reply_text("❌ Database offline.")
                 ctx.user_data.pop('action', None)
                 await self.admin_panel(update, ctx)
                 return
@@ -435,7 +474,7 @@ class Bot:
             await self.ask_approval(q, ctx)
             return
         if data == "cancel":
-            await q.message.edit_text("Cancelled.")
+            await q.message.edit_text("❌ Cancelled.")
             return
         if data.startswith("btn_"):
             await self.confirm_comment(q, data[4:])
@@ -445,19 +484,22 @@ class Bot:
             return
         if data == "main_menu":
             if not connected:
-                await q.message.edit_text("Database offline.")
+                await q.message.edit_text("❌ Database offline.")
                 return
             btns = list(buttons.find())
             if not btns:
-                await q.message.edit_text("No apps yet.")
+                await q.message.edit_text("📭 No apps available yet.")
                 return
             kb = [[InlineKeyboardButton(b['button_name'], callback_data=f"btn_{b['button_id']}")] for b in btns]
-            await q.message.edit_text("Select an app:", reply_markup=InlineKeyboardMarkup(kb))
+            await q.message.edit_text(
+                "🌟 Welcome To Comment Provider Bot By Zahid\n\nPlease select an app:",
+                reply_markup=InlineKeyboardMarkup(kb)
+            )
             return
 
         # Admin only beyond
         if q.from_user.id not in ADMIN_IDS:
-            await q.message.reply_text("Unauthorized")
+            await q.message.reply_text("⛔ Unauthorized")
             return
 
         if data == "admin":
@@ -529,7 +571,7 @@ def main():
     app.add_handler(CallbackQueryHandler(bot.callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
 
-    print("🤖 Bot running...")
+    print("🤖 Bot is running...")
     app.run_polling()
 
 if __name__ == "__main__":
