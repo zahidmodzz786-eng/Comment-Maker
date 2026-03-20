@@ -51,6 +51,7 @@ else:
         def update_one(self,*a,**k): raise Exception("Database offline")
         def delete_one(self,*a,**k): raise Exception("Database offline")
         def count_documents(self,*a,**k): return 0
+        def find_one_and_update(self,*a,**k): return None
     users = buttons = comments = settings = pending = Dummy()
 
 # ---------- Bot Class ----------
@@ -246,7 +247,7 @@ class Bot:
             return
         uid = query.from_user.id
 
-        # Check if user already got a comment for this button
+        # Check if user already got a comment for this button — 1 comment per app enforced here
         already = comments.find_one({'button_id': btn_id, 'used': True, 'used_by': uid})
         if already:
             await query.message.edit_text(
@@ -255,16 +256,21 @@ class Bot:
             )
             return
 
-        com = comments.find_one_and_delete({'button_id': btn_id, 'used': False}, sort=[('_id', 1)])
-        if com:
-            user = query.from_user
-            comments.update_one({'_id': com['_id']}, {'$set': {
+        # Atomic find + update in one operation — prevents race conditions
+        user = query.from_user
+        com = comments.find_one_and_update(
+            {'button_id': btn_id, 'used': False},
+            {'$set': {
                 'used': True,
                 'used_by': uid,
                 'used_date': datetime.now(),
                 'user_name': user.first_name,
                 'user_username': user.username
-            }})
+            }},
+            sort=[('_id', 1)],
+            return_document=True
+        )
+        if com:
             await query.message.edit_text(
                 f"✅ Here is your comment – tap and hold to copy:\n\n<code>{com['comment']}</code>",
                 parse_mode='HTML',
@@ -516,7 +522,7 @@ class Bot:
             await self.menu_comment_users(q)
             return
         if data.startswith("show_users_"):
-            btn_id = data[11:]  # after "show_users_"
+            btn_id = data[11:]
             await self.show_comment_users(q, btn_id)
             return
 
