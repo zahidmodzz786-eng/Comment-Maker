@@ -5,7 +5,7 @@ from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, filters, ContextTypes
+    MessageHandler, filters, ContextTypes, ConversationHandler
 )
 from pymongo import MongoClient
 
@@ -17,6 +17,9 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 ADMIN_IDS = list(map(int, os.environ.get('ADMIN_IDS', '').split(',')))
 MONGO_URI = os.environ.get('MONGO_URI')
+
+# Conversation states for admin actions
+WAITING_USER_ID = 1
 
 # ---------- MongoDB Connection ----------
 connected = False
@@ -72,18 +75,14 @@ class Bot:
         user = update.effective_user
         uid = user.id
 
-        # Admin gets admin panel
         if uid in ADMIN_IDS:
             return await self.admin_panel(update, ctx)
 
-        # Bot off?
         if not self.bot_on:
             return await update.message.reply_text("❌ No Apps Available For Comment")
 
-        # Check user status
         u = users.find_one({'user_id': uid}) if connected else None
         if u and u.get('approved'):
-            # Approved user: show main menu
             btns = list(buttons.find()) if connected else []
             if not btns:
                 return await update.message.reply_text("📭 No apps available yet.")
@@ -97,7 +96,6 @@ class Bot:
         elif u and u.get('pending'):
             await update.message.reply_text("⏳ Your approval is still pending. Please wait.")
         else:
-            # New user: ask for approval
             await self.request_approval_prompt(update, ctx)
 
     async def request_approval_prompt(self, update, ctx):
@@ -156,6 +154,90 @@ class Bot:
                 pass
             await query.message.edit_text(query.message.text + "\n\n❌ Rejected")
 
+    # ========== ADMIN: Allow User ==========
+    async def allow_user_start(self, query, ctx):
+        ctx.user_data['action'] = 'allow_user'
+        await query.message.reply_text("📝 Send the user ID of the user you want to allow:")
+        return WAITING_USER_ID
+
+    async def allow_user_id(self, update, ctx):
+        try:
+            uid = int(update.message.text)
+        except ValueError:
+            await update.message.reply_text("❌ Invalid user ID. Please send a numeric ID.")
+            return WAITING_USER_ID
+        users.update_one({'user_id': uid}, {'$set': {'approved': True, 'rejected': False, 'pending': False}}, upsert=True)
+        pending.delete_one({'user_id': uid})
+        try:
+            await ctx.bot.send_message(uid, "✅ You have been allowed to use the bot. Send /start to begin.")
+        except:
+            pass
+        await update.message.reply_text(f"✅ User {uid} has been allowed.")
+        ctx.user_data.pop('action', None)
+        await self.admin_panel(update, ctx)
+        return ConversationHandler.END
+
+    # ========== ADMIN: Ban User ==========
+    async def ban_user_start(self, query, ctx):
+        ctx.user_data['action'] = 'ban_user'
+        await query.message.reply_text("📝 Send the user ID of the user you want to ban:")
+        return WAITING_USER_ID
+
+    async def ban_user_id(self, update, ctx):
+        try:
+            uid = int(update.message.text)
+        except ValueError:
+            await update.message.reply_text("❌ Invalid user ID. Please send a numeric ID.")
+            return WAITING_USER_ID
+        users.update_one({'user_id': uid}, {'$set': {'approved': False, 'rejected': True, 'pending': False}}, upsert=True)
+        pending.delete_one({'user_id': uid})
+        try:
+            await ctx.bot.send_message(uid, "❌ You have been banned from using this bot. Contact @DTXZAHID")
+        except:
+            pass
+        await update.message.reply_text(f"✅ User {uid} has been banned.")
+        ctx.user_data.pop('action', None)
+        await self.admin_panel(update, ctx)
+        return ConversationHandler.END
+
+    # ========== ADMIN: Comment Users ==========
+    async def menu_comment_users(self, query):
+        if not connected:
+            await query.message.edit_text("❌ Database offline.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin")]]))
+            return
+        btns = list(buttons.find())
+        if not btns:
+            await query.message.edit_text("No buttons yet.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin")]]))
+            return
+        kb = [[InlineKeyboardButton(b['button_name'], callback_data=f"show_users_{b['button_id']}")] for b in btns]
+        kb.append([InlineKeyboardButton("🔙 Back", callback_data="admin")])
+        await query.message.edit_text("Select an app to see which users took comments:", reply_markup=InlineKeyboardMarkup(kb))
+
+    async def show_comment_users(self, query, btn_id):
+        btn = buttons.find_one({'button_id': btn_id})
+        if not btn:
+            await query.message.edit_text("Button not found.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="menu_comment_users")]]))
+            return
+        # Get all used comments for this button, sorted by used_date (most recent last)
+        used_comments = list(comments.find({'button_id': btn_id, 'used': True}).sort('used_date', 1))
+        if not used_comments:
+            await query.message.edit_text(f"No users have taken comments for {btn['button_name']} yet.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="menu_comment_users")]]))
+            return
+        # Build message
+        msg = f"📝 Users who took comments for *{btn['button_name']}*:\n\n"
+        for idx, c in enumerate(used_comments, 1):
+            uid = c.get('used_by')
+            name = c.get('user_name', 'Unknown')
+            username = c.get('user_username', '')
+            username_str = f"@{username}" if username else "No username"
+            msg += f"{idx}. {name} ({username_str}) – ID: `{uid}`\n"
+            # Avoid message too long – if exceeds 4000 chars, truncate and add note
+            if len(msg) > 3800:
+                msg += "\n... (list truncated)"
+                break
+        reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="menu_comment_users")]])
+        await query.message.edit_text(msg, parse_mode='Markdown', reply_markup=reply_markup)
+
     # ========== COMMENT FLOW ==========
     async def confirm_comment(self, query, btn_id):
         kb = [
@@ -178,15 +260,22 @@ class Bot:
         already = comments.find_one({'button_id': btn_id, 'used': True, 'used_by': uid})
         if already:
             await query.message.edit_text(
-                "🤷‍♂️ Bro, you already got 1 comment for this app.\n"
-                "If you want more, DM @DTXZAHID",
+                "🤷‍♂️ Already Given A Comment If You Want More Then Dm @DTXZAHID",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu")]])
             )
             return
 
         com = comments.find_one_and_delete({'button_id': btn_id, 'used': False}, sort=[('_id', 1)])
         if com:
-            comments.update_one({'_id': com['_id']}, {'$set': {'used': True, 'used_by': uid, 'used_date': datetime.now()}})
+            # Save user info in the comment document for later reference
+            user = query.from_user
+            comments.update_one({'_id': com['_id']}, {'$set': {
+                'used': True,
+                'used_by': uid,
+                'used_date': datetime.now(),
+                'user_name': user.first_name,
+                'user_username': user.username
+            }})
             await query.message.edit_text(
                 f"✅ Here is your comment – tap and hold to copy:\n\n<code>{com['comment']}</code>",
                 parse_mode='HTML',
@@ -211,7 +300,10 @@ class Bot:
                 [InlineKeyboardButton(f"🤖 Turn {'OFF' if s.get('bot_status') else 'ON'}", callback_data="toggle")],
                 [InlineKeyboardButton("🔘 Buttons", callback_data="menu_buttons")],
                 [InlineKeyboardButton("➕ Add Comments", callback_data="menu_add_comments"), InlineKeyboardButton("📊 Stats", callback_data="menu_stats")],
-                [InlineKeyboardButton("✏️ Over Message", callback_data="menu_overmsg"), InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu")]
+                [InlineKeyboardButton("✏️ Over Message", callback_data="menu_overmsg")],
+                [InlineKeyboardButton("👥 Allow User", callback_data="allow_user"), InlineKeyboardButton("🚫 Ban User", callback_data="ban_user")],
+                [InlineKeyboardButton("📝 Comment Users", callback_data="menu_comment_users")],
+                [InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu")]
             ]
             text = f"⚙️ Admin Panel\n\nBot Status: {status}"
         if edit:
@@ -417,6 +509,23 @@ class Bot:
             await self.handle_approval(q, ctx)
             return
 
+        # Allow/Ban user
+        if data == "allow_user":
+            await self.allow_user_start(q, ctx)
+            return
+        if data == "ban_user":
+            await self.ban_user_start(q, ctx)
+            return
+
+        # Comment Users
+        if data == "menu_comment_users":
+            await self.menu_comment_users(q)
+            return
+        if data.startswith("show_users_"):
+            btn_id = data[11:]  # after "show_users_"
+            await self.show_comment_users(q, btn_id)
+            return
+
         # Buttons
         if data == "menu_buttons":
             await self.menu_buttons(q)
@@ -452,14 +561,38 @@ class Bot:
             await self.menu_overmsg(q, ctx)
             return
 
+# ========== CONVERSATION HANDLERS ==========
+async def cancel_conversation(update, ctx):
+    await update.message.reply_text("❌ Operation cancelled.")
+    ctx.user_data.pop('action', None)
+    return ConversationHandler.END
+
 # ========== MAIN ==========
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     bot = Bot()
 
+    # Conversation handlers for allow/ban
+    allow_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(bot.allow_user_start, pattern="^allow_user$")],
+        states={
+            WAITING_USER_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot.allow_user_id)]
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conversation)]
+    )
+    ban_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(bot.ban_user_start, pattern="^ban_user$")],
+        states={
+            WAITING_USER_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot.ban_user_id)]
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conversation)]
+    )
+
     app.add_handler(CommandHandler("start", bot.start))
     app.add_handler(CommandHandler("admin", bot.admin_panel))
     app.add_handler(CallbackQueryHandler(bot.callback_handler))
+    app.add_handler(allow_conv)
+    app.add_handler(ban_conv)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
 
     print("🤖 Bot is running...")
