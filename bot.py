@@ -466,6 +466,52 @@ class Bot:
         else:
             await self.start(update, ctx)
 
+    # ========== CHECK JOIN AFTER CLICK (FIX) ==========
+    async def check_join_after_click(self, query, ctx):
+        user_id = query.from_user.id
+        ch_list = list(channels.find()) if connected else []
+        if not ch_list:
+            # No channels, go to approval
+            keyboard = [
+                [InlineKeyboardButton("✅ Request Approval", callback_data="ask_approval")],
+                [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
+            ]
+            await query.message.edit_text(
+                "🔐 You need admin approval to use this bot.\n\nDo you want to send a request?",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return
+
+        not_joined = []
+        for ch in ch_list:
+            try:
+                member = await ctx.bot.get_chat_member(chat_id=ch['channel_id'], user_id=user_id)
+                if member.status not in ['member', 'administrator', 'creator']:
+                    not_joined.append(ch)
+            except:
+                not_joined.append(ch)
+
+        if not_joined:
+            # Update the current message with same join buttons
+            keyboard = []
+            for ch in not_joined:
+                keyboard.append([InlineKeyboardButton(f"🔗 Join {ch['channel_name']}", url=ch['channel_link'])])
+            keyboard.append([InlineKeyboardButton("✅ I've Joined", callback_data="check_join")])
+            await query.message.edit_text(
+                "📢 Please join these channels first:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        else:
+            # All joined, show approval prompt
+            keyboard = [
+                [InlineKeyboardButton("✅ Request Approval", callback_data="ask_approval")],
+                [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
+            ]
+            await query.message.edit_text(
+                "🔐 You need admin approval to use this bot.\n\nDo you want to send a request?",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+
     # ========== CALLBACK HANDLER ==========
     async def callback_handler(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
@@ -474,7 +520,7 @@ class Bot:
 
         # Public callbacks
         if data == "check_join":
-            await self.start(q, ctx)
+            await self.check_join_after_click(q, ctx)
             return
         if data == "ask_approval":
             await self.ask_approval(q, ctx)
