@@ -43,6 +43,9 @@ if connected:
     pending = db['pending']
     if not settings.find_one():
         settings.insert_one({'bot_status': True, 'over_message': 'No more comments available for this app.'})
+    # Indexes for faster queries and accurate lookups
+    comments.create_index([('button_id', 1), ('used', 1)])
+    comments.create_index([('button_id', 1), ('used', 1), ('used_by', 1)])
 else:
     class Dummy:
         def find_one(self,*a,**k): return None
@@ -50,8 +53,10 @@ else:
         def insert_one(self,*a,**k): raise Exception("Database offline")
         def update_one(self,*a,**k): raise Exception("Database offline")
         def delete_one(self,*a,**k): raise Exception("Database offline")
+        def delete_many(self,*a,**k): raise Exception("Database offline")
         def count_documents(self,*a,**k): return 0
         def find_one_and_update(self,*a,**k): return None
+        def create_index(self,*a,**k): pass
     users = buttons = comments = settings = pending = Dummy()
 
 # ---------- Bot Class ----------
@@ -197,58 +202,77 @@ class Bot:
     # ========== ADMIN: Comment Users ==========
     async def menu_comment_users(self, query):
         if not connected:
-            await query.message.edit_text("❌ Database offline.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin")]]))
+            await query.message.edit_text("❌ Database offline.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin")]]))
             return
         btns = list(buttons.find())
         if not btns:
-            await query.message.edit_text("No buttons yet.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin")]]))
+            await query.message.edit_text("No buttons yet.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin")]]))
             return
         kb = [[InlineKeyboardButton(b['button_name'], callback_data=f"show_users_{b['button_id']}")] for b in btns]
         kb.append([InlineKeyboardButton("🔙 Back", callback_data="admin")])
         await query.message.edit_text("Select an app to see which users took comments:", reply_markup=InlineKeyboardMarkup(kb))
 
     async def show_comment_users(self, query, btn_id):
+        # FIX 2: Strict query — only docs where used=True AND used_by exists and is not None
+        used_comments = list(
+            comments.find({
+                'button_id': btn_id,
+                'used': True,
+                'used_by': {'$exists': True, '$ne': None}
+            }).sort('used_date', 1)
+        )
+
         btn = buttons.find_one({'button_id': btn_id})
-        if not btn:
-            await query.message.edit_text("Button not found.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="menu_comment_users")]]))
-            return
-        used_comments = list(comments.find({'button_id': btn_id, 'used': True}).sort('used_date', 1))
+        btn_name = btn['button_name'] if btn else btn_id
+
         if not used_comments:
-            await query.message.edit_text(f"No users have taken comments for {btn['button_name']} yet.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="menu_comment_users")]]))
+            await query.message.edit_text(
+                f"No users have taken comments for *{btn_name}* yet.",
+                parse_mode='Markdown',
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="menu_comment_users")]])
+            )
             return
-        msg = f"📝 Users who took comments for *{btn['button_name']}*:\n\n"
+
+        # Build lines first then chunk — avoids message too long error that caused load failure
+        lines = []
         for idx, c in enumerate(used_comments, 1):
             uid = c.get('used_by')
             name = c.get('user_name', 'Unknown')
             username = c.get('user_username', '')
             username_str = f"@{username}" if username else "No username"
-            msg += f"{idx}. {name} ({username_str}) – ID: `{uid}`\n"
-            if len(msg) > 3800:
-                msg += "\n... (list truncated)"
-                break
+            lines.append(f"{idx}. {name} ({username_str}) – ID: `{uid}`")
+
+        header = f"📝 Users who took comments for *{btn_name}*:\n\n"
+        msg = header
+        chunks = []
+        for line in lines:
+            if len(msg) + len(line) + 1 > 3800:
+                chunks.append(msg)
+                msg = header + "(continued...)\n\n"
+            msg += line + "\n"
+        chunks.append(msg)
+
         reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="menu_comment_users")]])
-        await query.message.edit_text(msg, parse_mode='Markdown', reply_markup=reply_markup)
+
+        # Edit first chunk, send extra chunks as new messages
+        await query.message.edit_text(chunks[0], parse_mode='Markdown', reply_markup=reply_markup if len(chunks) == 1 else None)
+        for i, chunk in enumerate(chunks[1:], 1):
+            is_last = (i == len(chunks) - 1)
+            await query.message.reply_text(chunk, parse_mode='Markdown', reply_markup=reply_markup if is_last else None)
 
     # ========== COMMENT FLOW ==========
-    async def confirm_comment(self, query, btn_id):
-        kb = [
-            [InlineKeyboardButton("✅ I Agree", callback_data=f"agree_{btn_id}")],
-            [InlineKeyboardButton("❌ No", callback_data="main_menu")]
-        ]
-        await query.message.edit_text(
-            "⚠️ Do you really want this app comment?\n"
-            "Note: If you don't do 2-3 apps you may be banned.",
-            reply_markup=InlineKeyboardMarkup(kb)
-        )
-
     async def give_comment(self, query, btn_id):
         if not connected:
             await query.message.edit_text("❌ Database offline.")
             return
         uid = query.from_user.id
 
-        # Check if user already got a comment for this button — 1 comment per app enforced here
-        already = comments.find_one({'button_id': btn_id, 'used': True, 'used_by': uid})
+        # FIX 3: Strict match on used=True AND used_by=uid — prevents false "already got comment"
+        already = comments.find_one({
+            'button_id': btn_id,
+            'used': True,
+            'used_by': uid
+        })
         if already:
             await query.message.edit_text(
                 "Already Comment Given Want More Comments? Dm @DTXZAHID",
@@ -256,7 +280,7 @@ class Bot:
             )
             return
 
-        # Atomic find + update in one operation — prevents race conditions
+        # Atomic operation — grab and mark used in one step, no race condition
         user = query.from_user
         com = comments.find_one_and_update(
             {'button_id': btn_id, 'used': False},
@@ -411,7 +435,6 @@ class Bot:
         text = update.message.text
         action = ctx.user_data.get('action')
 
-        # Only admins can perform admin actions
         if user_id not in ADMIN_IDS:
             await self.start(update, ctx)
             return
@@ -473,11 +496,9 @@ class Bot:
         if data == "cancel":
             await q.message.edit_text("❌ Cancelled.")
             return
+        # FIX 1: Tapping an app button goes directly to give_comment — no "I Agree" step
         if data.startswith("btn_"):
-            await self.confirm_comment(q, data[4:])
-            return
-        if data.startswith("agree_"):
-            await self.give_comment(q, data[6:])
+            await self.give_comment(q, data[4:])
             return
         if data == "main_menu":
             if not connected:
@@ -494,7 +515,7 @@ class Bot:
             )
             return
 
-        # Admin only beyond
+        # Admin only beyond this point
         if q.from_user.id not in ADMIN_IDS:
             await q.message.reply_text("⛔ Unauthorized")
             return
@@ -508,25 +529,18 @@ class Bot:
         if data.startswith("app_") or data.startswith("rej_"):
             await self.handle_approval(q, ctx)
             return
-
-        # Allow/Ban user
         if data == "allow_user":
             await self.allow_user_start(q, ctx)
             return
         if data == "ban_user":
             await self.ban_user_start(q, ctx)
             return
-
-        # Comment Users
         if data == "menu_comment_users":
             await self.menu_comment_users(q)
             return
         if data.startswith("show_users_"):
-            btn_id = data[11:]
-            await self.show_comment_users(q, btn_id)
+            await self.show_comment_users(q, data[11:])
             return
-
-        # Buttons
         if data == "menu_buttons":
             await self.menu_buttons(q)
             return
@@ -539,24 +553,18 @@ class Bot:
         if data.startswith("delbtn_"):
             await self.delete_button(q, data[7:])
             return
-
-        # Add comments
         if data == "menu_add_comments":
             await self.menu_add_comments(q)
             return
         if data.startswith("selbtn_"):
             await self.select_button_for_comments(q, ctx)
             return
-
-        # Stats
         if data == "menu_stats":
             await self.menu_stats(q)
             return
         if data.startswith("stat_"):
             await self.show_stats(q, data[5:])
             return
-
-        # Over message
         if data == "menu_overmsg":
             await self.menu_overmsg(q, ctx)
             return
@@ -576,3 +584,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
